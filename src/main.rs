@@ -1360,10 +1360,13 @@ fn draw_metric_panel(
     let cells_y = iy + big_h.saturating_sub(bt);
     let cells_h = (iy + ih).saturating_sub(cells_y);
     let cw = (iw + bt) / 2;
+    // Skala nilai sel kecil dikurangi supaya ada jarak vertikal dari label
+    // (di panel 1/3 tinggi, nilai skala penuh menempel persis di bawah label).
+    let cell_value_scale = value_scale.saturating_sub(2);
     for (c, (cl, cv)) in cells.iter().enumerate() {
         let cx = ix + c as u32 * cw.saturating_sub(bt);
         let cww = if c == 1 { (ix + iw).saturating_sub(cx) } else { cw };
-        draw_metric_cell(fb, cx, cells_y, cww, cells_h, cl, cv, None, p, value_scale, detail_scale);
+        draw_metric_cell(fb, cx, cells_y, cww, cells_h, cl, cv, None, p, cell_value_scale, detail_scale);
     }
 }
 
@@ -1383,10 +1386,13 @@ fn draw_net_panel(
     let (ix, iy, iw, ih) = draw_panel_chrome(fb, x, y, w, h, "NET", p, 3);
     let bt = p.border_thickness;
     let cw = (iw + bt) / 2;
-    draw_metric_cell(fb, ix, iy, cw, ih, dl.0, &dl.1, Some(dl.2), p, value_scale, detail_scale);
+    // Nilai DL/UP sedikit lebih kecil dari nilai besar panel lain — tetap
+    // terbaca, tapi tidak menempel ke labelnya.
+    let cell_value_scale = value_scale.saturating_sub(1);
+    draw_metric_cell(fb, ix, iy, cw, ih, dl.0, &dl.1, Some(dl.2), p, cell_value_scale, detail_scale);
     let up_x = ix + cw.saturating_sub(bt);
     let up_w = (ix + iw).saturating_sub(up_x);
-    draw_metric_cell(fb, up_x, iy, up_w, ih, up.0, &up.1, Some(up.2), p, value_scale, detail_scale);
+    draw_metric_cell(fb, up_x, iy, up_w, ih, up.0, &up.1, Some(up.2), p, cell_value_scale, detail_scale);
 }
 
 /// Panel AI INFERENCE: baris model+status (marquee) di atas, lalu sel-sel
@@ -1474,6 +1480,7 @@ fn draw_ai_panel(
     let (cols, rows): (u32, u32) = if wide { (4, 1) } else { (2, 2) };
     let cw = (iw + bt * (cols - 1)) / cols;
     let ch = (cells_area_h + bt * (rows - 1)) / rows;
+    let cell_value_scale = value_scale.saturating_sub(1);
     for (i, (label, value, unit)) in cells.iter().enumerate() {
         let col = (i as u32) % cols;
         let row = (i as u32) / cols;
@@ -1482,7 +1489,7 @@ fn draw_ai_panel(
         let cww = if col + 1 == cols { (ix + iw).saturating_sub(cx) } else { cw };
         let chh = if row + 1 == rows { (iy + ih).saturating_sub(cy) } else { ch };
         let unit = if unit.is_empty() { None } else { Some(*unit) };
-        draw_metric_cell(fb, cx, cy, cww, chh, label, value, unit, p, value_scale, detail_scale);
+        draw_metric_cell(fb, cx, cy, cww, chh, label, value, unit, p, cell_value_scale, detail_scale);
     }
 }
 
