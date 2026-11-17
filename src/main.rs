@@ -2254,7 +2254,8 @@ fn level_color(level: f32, color_mode: ColorMode) -> (u8, u8, u8) {
 /// diredupkan) supaya jelas kebaca dari jarak jauh saat layar lagi "kosong".
 fn accent_color(color_mode: ColorMode) -> (u8, u8, u8) {
     match color_mode {
-        ColorMode::Default => (0xE0, 0xE0, 0xE0),
+        // Hijau gelap (diminta: bingkai panel — tadinya abu terang/putih).
+        ColorMode::Default => (0x0C, 0x78, 0x38),
         ColorMode::Custom(r, g, b) => (r, g, b),
     }
 }
