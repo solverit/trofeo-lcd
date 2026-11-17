@@ -61,13 +61,6 @@ pub fn take_latest(ring: &SharedRing, n: usize) -> Vec<f32> {
     out
 }
 
-/// Ring buffer tanpa thread capture — dipakai `--no-audio`: sample selalu
-/// nol (dianggap "diam"), jadi loop utama tetap jalan tanpa mengubah bentuk
-/// kodenya.
-pub fn dummy_ring() -> SharedRing {
-    Arc::new(Mutex::new(VecDeque::with_capacity(0)))
-}
-
 /// Mulai thread capture audio di background, kembalikan handle ring buffer
 /// yang terus diisi.
 pub fn spawn_capture() -> anyhow::Result<SharedRing> {

@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use crate::{Framebuffer, LcdError, Resolution, Result, Rotation, VENDOR_ID, MAX_FRAME_BYTES};
+use crate::{Framebuffer, LcdError, Resolution, Result, Rotation, MAX_FRAME_BYTES, VENDOR_ID};
 
 use hidapi::{HidApi, HidDevice};
 
@@ -94,7 +94,7 @@ impl HidLcd {
             },
             rotation_override,
         };
-        lcd.handshake()?;
+        lcd.handshake(info.release_number())?;
         Ok(lcd)
     }
 
@@ -114,7 +114,16 @@ impl HidLcd {
 
     /// Handshake Type 2: kirim init packet 512-byte, baca respons, parse
     /// PM/SUB, lalu resolve resolusi + rotasi wire dari tabel PM/FBL.
-    fn handshake(&mut self) -> Result<()> {
+    fn handshake(&mut self, release: u16) -> Result<()> {
+        // Some 4.07 devices volunteer their identity and reboot on init.
+        // A silent 4.07 Trofeo still needs the ordinary handshake.
+        if release == 0x0407 {
+            let unsolicited = self.hid_read(Duration::from_secs(5))?;
+            if !unsolicited.is_empty() {
+                self.handshake = parse_handshake(unsolicited, true)?;
+                return Ok(());
+            }
+        }
         let mut init = [0u8; REPORT_SIZE];
         init[0..4].copy_from_slice(&MAGIC);
         init[12] = 0x01;
@@ -122,37 +131,16 @@ impl HidLcd {
         self.hid_write(&init)?;
         let resp = self.hid_read(HANDSHAKE_TIMEOUT)?;
 
-        if resp.len() < 6 || resp[0..4] != MAGIC {
-            return Err(LcdError::BadHandshake(resp));
-        }
-        // Firmware biasa: resp[12] == 0x01 dan len >= 20. Firmware streaming
-        // menjawab 8 byte — magic saja sudah cukup identifikasi (port perilaku
-        // `_validate_response_type2` dengan quirk short_handshake).
-        let sub = resp[4];
-        let pm = resp[5];
-        if pm == 0 {
-            return Err(LcdError::BadHandshake(resp));
-        }
-
-        let (width, height) = resolve_resolution(pm, sub);
-        let wire_rotation = resolve_wire_rotation(width, height, sub);
-        self.handshake = HidHandshake {
-            pm,
-            sub,
-            width,
-            height,
-            wire_rotation,
-        };
+        self.handshake = parse_handshake(resp, release == 0x0407)?;
         Ok(())
     }
 
     /// Tulis satu HID report (512-byte data). Report-ID 0x00 ditambahkan
     /// otomatis di depan (perangkat ini tidak pakai numbered reports).
     fn hid_write(&self, data: &[u8]) -> Result<()> {
-        debug_assert_eq!(data.len() % REPORT_SIZE, 0);
-        let mut buf = Vec::with_capacity(data.len() + 1);
-        buf.push(0x00);
-        buf.extend_from_slice(data);
+        debug_assert_eq!(data.len(), REPORT_SIZE);
+        let mut buf = [0u8; REPORT_SIZE + 1];
+        buf[1..].copy_from_slice(data);
 
         let mut last_err = None;
         for _ in 0..WRITE_RETRIES {
@@ -174,7 +162,10 @@ impl HidLcd {
         let mut buf = vec![0u8; REPORT_SIZE];
         let n = self
             .device
-            .read_timeout(&mut buf, (timeout.as_millis() as u64).min(i32::MAX as u64) as i32)
+            .read_timeout(
+                &mut buf,
+                (timeout.as_millis() as u64).min(i32::MAX as u64) as i32,
+            )
             .map_err(|e| LcdError::Hid(format!("HID read gagal: {e}")))?;
         buf.truncate(n);
         Ok(buf)
@@ -183,27 +174,7 @@ impl HidLcd {
     /// Kirim satu payload JPEG (sudah di-encode). Menyusun header Type 2,
     /// padding ke kelipatan 512, lalu menulis per-report 512-byte.
     pub fn send_jpeg(&self, jpeg: &[u8]) -> Result<()> {
-        if jpeg.is_empty() {
-            return Err(LcdError::EmptyFrame);
-        }
-        if jpeg.len() > MAX_FRAME_BYTES {
-            return Err(LcdError::FrameTooLarge(jpeg.len()));
-        }
-
-        let hs = &self.handshake;
-        let mut frame = Vec::with_capacity(20 + jpeg.len() + REPORT_SIZE);
-        frame.extend_from_slice(&MAGIC);
-        frame.extend_from_slice(&[0x02, 0x00]); // cmd_type = PICTURE
-        frame.extend_from_slice(&[0x00, 0x00]); // mode = JPEG
-        frame.extend_from_slice(&(hs.width as u16).to_le_bytes());
-        frame.extend_from_slice(&(hs.height as u16).to_le_bytes());
-        frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
-        frame.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
-        frame.extend_from_slice(jpeg);
-        while frame.len() % REPORT_SIZE != 0 {
-            frame.push(0);
-        }
-
+        let frame = build_frame(&self.handshake, jpeg)?;
         for chunk in frame.chunks_exact(REPORT_SIZE) {
             self.hid_write(chunk)?;
         }
@@ -214,7 +185,12 @@ impl HidLcd {
     /// Rangkaian: terapkan rotasi user (`--rotate`, termasuk 180°) lalu
     /// rotasi wire panel (default dari tabel PM/SUB, atau `--hid-rotate`),
     /// encode JPEG, kirim.
-    pub fn send_framebuffer(&self, fb: &Framebuffer, quality: u8, rotation: Rotation) -> Result<()> {
+    pub fn send_framebuffer(
+        &self,
+        fb: &Framebuffer,
+        quality: u8,
+        rotation: Rotation,
+    ) -> Result<()> {
         let owned180 = if rotation == Rotation::Deg180 {
             Some(fb.rotated_180())
         } else {
@@ -232,73 +208,64 @@ impl HidLcd {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Tabel PM/FBL — port dari `core/protocol.py` thermalright-trcc-linux
-// (FBL_PROFILES + _PM_TO_FBL_OVERRIDES + _FBL_192/224_BY_PM). Cukup baris
-// yang relevan untuk panel JPEG; PM lain (RGB565 kecil) tidak mungkin
-// muncul di 0416:5302 versi firmware ini, tapi tetap dimapping ke ukuran
-// yang benar supaya frame tidak kacau.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// PM byte → FBL byte (konvensi SCSI: PM == FBL, kecuali override ini).
-fn pm_to_fbl(pm: u8, sub: u8) -> u8 {
-    match (pm, sub) {
-        (1, 49) => 192,
-        (1, 48) => 114,
-        _ => match pm {
-            5 => 50,
-            7 => 64,
-            9 | 11 | 20 => 224,
-            10 => 224,
-            12 => 224,
-            13 | 17 | 18 => 224,
-            14 => 64,
-            15 => 224,
-            16 => 224,
-            32 => 100,
-            50 => 50,
-            63 => 114,
-            64 => 114,
-            65 => 192,
-            66 => 192,
-            68 => 192,
-            69 => 192,
-            other => other,
-        },
+fn build_frame(hs: &HidHandshake, jpeg: &[u8]) -> Result<Vec<u8>> {
+    if jpeg.is_empty() {
+        return Err(LcdError::EmptyFrame);
     }
+    if jpeg.len() > MAX_FRAME_BYTES {
+        return Err(LcdError::FrameTooLarge(jpeg.len()));
+    }
+
+    let mut frame = Vec::with_capacity(20 + jpeg.len() + REPORT_SIZE);
+    frame.extend_from_slice(&MAGIC);
+    frame.extend_from_slice(&[0x02, 0x00]); // cmd_type = PICTURE
+    frame.extend_from_slice(&[0x00, 0x00]); // mode = JPEG
+    frame.extend_from_slice(&(hs.width as u16).to_le_bytes());
+    frame.extend_from_slice(&(hs.height as u16).to_le_bytes());
+    frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+    frame.extend_from_slice(jpeg);
+    frame.resize(frame.len().div_ceil(REPORT_SIZE) * REPORT_SIZE, 0);
+
+    Ok(frame)
 }
 
-/// FBL (+ PM untuk FBL 192/224 yang dipakai beberapa resolusi) → (w, h).
-/// Semua panel yang bisa muncul di jalur ini JPEG; kalau FBL tidak dikenal,
-/// fallback 1280x480 (panel paling umum untuk 0416:5302 Trofeo Vision).
-fn resolve_resolution(pm: u8, sub: u8) -> (u32, u32) {
-    let fbl = pm_to_fbl(pm, sub);
-    match fbl {
-        36 | 37 => (240, 240),
-        49 | 50 | 51 | 52 | 53 | 58 => (320, 240),
-        54 => (360, 360),
-        60 => (320, 176),
-        59 => (640, 172),
-        64 => (640, 480),
-        72 | 129 => (480, 480),
-        100 | 101 | 102 => (320, 320),
-        114 => (1600, 720),
-        128 => (1280, 480),
-        192 => match pm {
-            68 => (1280, 480),
-            69 => (1920, 440),
-            _ => (1920, 462),
-        },
-        224 => match pm {
-            9 | 11 | 20 => (854, 480),
-            10 | 16 => (960, 540),
-            12 => (800, 480),
-            13 | 17 | 18 => (960, 320),
-            15 => (640, 172),
-            _ => (854, 480),
-        },
-        _ => (1280, 480),
+fn parse_handshake(resp: Vec<u8>, short_reply: bool) -> Result<HidHandshake> {
+    let standard = resp.len() >= 20 && resp[12] == 1;
+    if !resp.starts_with(&MAGIC) || !(standard || (short_reply && resp.len() == 8)) {
+        return Err(LcdError::BadHandshake(resp));
     }
+    let (sub, pm) = (resp[4], resp[5]);
+    let (width, height) = jpeg_resolution(pm, sub).ok_or_else(|| {
+        LcdError::Hid(format!(
+            "Unsupported HID panel PM={pm} SUB={sub} (JPEG profile required)"
+        ))
+    })?;
+    Ok(HidHandshake {
+        pm,
+        sub,
+        width,
+        height,
+        wire_rotation: resolve_wire_rotation(width, height, sub),
+    })
+}
+
+/// Known JPEG profiles from thermalright-trcc-linux/core/protocol.py. Several
+/// other PMs on this same USB ID require RGB565.
+fn jpeg_resolution(pm: u8, sub: u8) -> Option<(u32, u32)> {
+    Some(match (pm, sub) {
+        (128 | 68, _) => (1280, 480),
+        (65 | 66 | 192, _) | (1, 49) => (1920, 462),
+        (69, _) => (1920, 440),
+        (63 | 64 | 114, _) | (1, 48) => (1600, 720),
+        (9 | 11 | 20 | 224, _) => (854, 480),
+        (10 | 16, _) => (960, 540),
+        (12, _) => (800, 480),
+        (13 | 17 | 18, _) => (960, 320),
+        (15, _) => (640, 172),
+        (54, sub) if sub != 4 => (360, 360),
+        _ => return None,
+    })
 }
 
 /// Rotasi wire frame (derajat, searah jarum jam) sebelum encode JPEG — port
@@ -352,14 +319,14 @@ mod tests {
     #[test]
     fn unit_trofeo_vision_hid_pm128_sub2() {
         // Unit nyata di mesin ini: PM=128 SUB=2 → 1280x480, wire 90°.
-        assert_eq!(resolve_resolution(128, 2), (1280, 480));
+        assert_eq!(jpeg_resolution(128, 2), Some((1280, 480)));
         assert_eq!(resolve_wire_rotation(1280, 480, 2), 90);
         assert_eq!(resolve_wire_rotation(1280, 480, 1), 0);
     }
 
     #[test]
     fn pm65_maps_to_1920x462() {
-        assert_eq!(resolve_resolution(65, 0), (1920, 462));
+        assert_eq!(jpeg_resolution(65, 0), Some((1920, 462)));
         assert_eq!(resolve_wire_rotation(1920, 462, 0), 180);
         assert_eq!(resolve_wire_rotation(1920, 462, 3), 0);
     }
@@ -374,15 +341,11 @@ mod tests {
             height: 480,
             wire_rotation: 90,
         };
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&MAGIC);
-        frame.extend_from_slice(&[0x02, 0x00]);
-        frame.extend_from_slice(&[0x00, 0x00]);
-        frame.extend_from_slice(&(hs.width as u16).to_le_bytes());
-        frame.extend_from_slice(&(hs.height as u16).to_le_bytes());
-        frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
-        frame.extend_from_slice(&1234u32.to_le_bytes());
-        assert_eq!(frame.len(), 20);
+        let jpeg = vec![0xaa; 1234];
+        let frame = build_frame(&hs, &jpeg).unwrap();
+        assert_eq!(frame.len(), 3 * REPORT_SIZE);
+        assert_eq!(&frame[20..1254], &jpeg);
+        assert!(frame[1254..].iter().all(|&b| b == 0));
         assert_eq!(&frame[0..4], &[0xDA, 0xDB, 0xDC, 0xDD]);
         assert_eq!(frame[4], 0x02);
         assert_eq!(frame[6], 0x00);
@@ -390,5 +353,25 @@ mod tests {
         assert_eq!(frame[10..12], 480u16.to_le_bytes());
         assert_eq!(frame[12], 0x02);
         assert_eq!(frame[16..20], 1234u32.to_le_bytes());
+    }
+    #[test]
+    fn rejects_unknown_rgb565_and_invalid_responses() {
+        let mut response = vec![0; 20];
+        response[..4].copy_from_slice(&MAGIC);
+        response[5] = 128;
+        assert!(parse_handshake(response.clone(), true).is_err());
+        response[12] = 1;
+        assert_eq!(
+            parse_handshake(response.clone(), false).unwrap().width,
+            1280
+        );
+        for pm in [0, 51, 58, 255] {
+            response[5] = pm;
+            assert!(parse_handshake(response.clone(), false).is_err());
+        }
+        response[5] = 128;
+        response.truncate(8);
+        assert!(parse_handshake(response.clone(), false).is_err());
+        assert!(parse_handshake(response, true).is_ok());
     }
 }

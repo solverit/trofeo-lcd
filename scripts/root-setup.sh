@@ -1,43 +1,50 @@
 #!/usr/bin/env bash
-# Setup sekali-jalan yang butuh root (dijalankan via sudo):
-#   sudo bash /home/mikay/Projects/trofeo-lcd/scripts/root-setup.sh
-#
-# 1. Pasang dependency build (libusb/hidapi headers) kalau belum ada.
-# 2. Pasang udev rule supaya LCD Thermalright bisa diakses user biasa
-#    tanpa root (bulk LY 0416:5408/5409 dan varian HID 0416:5302).
-# 3. Reload udev dan re-apply rule ke device yang sudah terpasang.
+# Install Linux build dependencies and USB rules. Optional CPU power access
+# is granted to the invoking user via the trofeo-rapl group.
 set -euo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-    echo "Jalankan dengan sudo: sudo bash $0" >&2
+if (( $# > 1 )) || [[ ${1:-} != "" && ${1:-} != --rapl ]]; then
+    echo "Usage: sudo bash $0 [--rapl]" >&2
+    exit 2
+fi
+if (( EUID != 0 )); then
+    echo "Run with sudo: sudo bash $0 [--rapl]" >&2
     exit 1
 fi
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+rule=/etc/udev/rules.d/99-trofeo-lcd.rules
 
-echo "== [1/3] Dependency build (apt) =="
-if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq || true
-    apt-get install -y --no-install-recommends \
-        build-essential pkg-config libusb-1.0-0-dev libudev-dev libhidapi-dev \
-        libpulse-dev || true
+if command -v apt-get >/dev/null; then
+    apt-get update -qq
+    apt-get install -y --no-install-recommends build-essential pkg-config \
+        libusb-1.0-0-dev libudev-dev libpulse-dev
 else
-    echo "apt-get tidak ada — asumsikan dependency sudah terpasang."
+    echo "Install the libudev and PulseAudio development packages with your package manager."
 fi
 
-echo "== [2/3] Udev rule =="
-install -m 0644 "$REPO_DIR/99-trofeo-lcd.rules" /etc/udev/rules.d/99-trofeo-lcd.rules
+# Undo the old installer's grant on live nodes as well as replacing its rule.
+if [[ -f "$rule" ]] && grep -Fq 'chmod 0444 /sys/class/powercap/' "$rule"; then
+    for counter in /sys/class/powercap/intel-rapl*/energy_uj; do
+        [[ -e "$counter" ]] || continue
+        chmod 0400 "$counter"
+    done
+fi
+install -m 0644 "$repo_dir/99-trofeo-lcd.rules" "$rule"
 
-echo "== [3/3] Reload udev & re-trigger =="
+if [[ ${1:-} == --rapl ]]; then
+    getent group trofeo-rapl >/dev/null || groupadd --system trofeo-rapl
+    if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+        usermod -aG trofeo-rapl "$SUDO_USER"
+        echo "Log out and back in for the new group membership."
+    fi
+    install -m 0644 "$repo_dir/scripts/99-trofeo-rapl.rules" /etc/udev/rules.d/
+fi
+
 udevadm control --reload-rules
-udevadm trigger --subsystem-match=usb --action=change || true
-# Re-apply ke node hidraw yang sudah ada (MODE/GROUP tidak re-evaluate
-# otomatis oleh trigger usb; jalan langsung juga pada hidraw).
-udevadm trigger --subsystem-match=hidraw --action=change || true
-# Buka akses baca counter energi RAPL (power CPU) sekarang juga, tanpa
-# menunggu event udev berikutnya.
-chmod 0444 /sys/class/powercap/intel-rapl*/energy_uj 2>/dev/null || true
-
-echo "Selesai. Cek akses:"
-ls -la /dev/hidraw* 2>/dev/null || true
-ls -la /sys/class/powercap/intel-rapl*/energy_uj 2>/dev/null || true
+udevadm trigger --subsystem-match=usb --attr-match=idVendor=0416 --action=change
+udevadm trigger --subsystem-match=hidraw --action=change
+if [[ -f /etc/udev/rules.d/99-trofeo-rapl.rules ]]; then
+    udevadm trigger --subsystem-match=powercap --action=change
+fi
+udevadm settle

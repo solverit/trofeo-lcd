@@ -1,4 +1,4 @@
-//! Audio visualizer (bar EQ) + info sistem untuk Trofeo Vision 9.16 LCD.
+//! Audio visualizer and system dashboard for the Trofeo LCD.
 //!
 //! Menampilkan:
 //! - Bar EQ dari audio yang sedang diputar di komputer (loopback — bukan
@@ -32,6 +32,11 @@ mod foreground;
 mod gpu;
 mod gpu_amd;
 mod inferrig;
+mod settings;
+mod dashboard;
+mod grid;
+use dashboard::{draw_inference, Palette, Readings};
+use settings::{Profile, Theme};
 mod media;
 mod netdisk;
 mod openrgb_sync;
@@ -44,9 +49,9 @@ use chrono::Local;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 use sysinfo::System;
-use trofeo_lcd::hid_lcd::HidLcd;
-use trofeo_lcd::{Framebuffer, LyLcd, Resolution, Rotation, TROFEO_VISION_9_16};
+use trofeo_lcd::Screen;
 use trofeo_lcd::{hotkey, png_save};
+use trofeo_lcd::{Framebuffer, Resolution, Rotation};
 
 /// Jumlah bar EQ yang digambar.
 const NUM_BARS: usize = 48;
@@ -206,7 +211,9 @@ struct Config {
     /// Rotasi layar (0/90/180/270 derajat).
     rotation: Rotation,
     /// Tampilan lama (bar EQ / jam idle / dashboard). Default: grid layout baru.
-    classic: bool,
+    profile: Profile,
+    theme: Theme,
+    net_peak_half_life_secs: f64,
     /// Matikan semua jalur audio/media: tanpa capture loopback, tanpa
     /// watcher judul lagu, tanpa pembacaan volume master. Dipakai kalau
     /// layar hanya untuk monitoring sistem (bukan visualizer musik).
@@ -227,6 +234,10 @@ fn print_help() {
          FPS pengiriman ke layar adaptif: turun ke --idle-fps saat tidak ada\n\
          suara terdeteksi, naik ke --active-fps begitu ada suara lagi.\n\
          \n\
+         --config <PATH>           Dashboard JSON configuration\n\
+         --profile <NAME>          grid (default), inference, classic\n\
+         --theme <NAME>            standard or terminal\n\
+         --audio / --no-audio      Override configured audio capture\n\
          Opsi:\n\
          \x20\x20--idle-fps <N>            FPS saat diam (default: {DEFAULT_IDLE_FPS})\n\
          \x20\x20--active-fps <N>          FPS saat ada suara (default: {DEFAULT_ACTIVE_FPS})\n\
@@ -315,7 +326,7 @@ fn parse_color(raw: &str) -> anyhow::Result<ColorMode> {
     }
 
     if let Some(hex) = raw.strip_prefix('#') {
-        if hex.len() == 6 {
+        if hex.len() == 6 && hex.is_ascii() {
             let parse_byte = |s: &str| {
                 u8::from_str_radix(s, 16)
                     .map_err(|_| anyhow::anyhow!("--color: '{raw}' bukan hex RGB yang valid"))
@@ -348,8 +359,14 @@ fn parse_color(raw: &str) -> anyhow::Result<ColorMode> {
 
 /// Parse argumen command-line, isi nilai default kalau tidak diberikan.
 fn parse_args() -> anyhow::Result<Config> {
-    let mut idle_fps = DEFAULT_IDLE_FPS;
-    let mut active_fps = DEFAULT_ACTIVE_FPS;
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> anyhow::Result<Config> {
+    let mut config_path = None;
+    let mut theme = None;
+    let mut idle_fps = None;
+    let mut active_fps = None;
     let mut silence_threshold = DEFAULT_SILENCE_THRESHOLD;
     let mut silence_timeout_ms = DEFAULT_SILENCE_TIMEOUT_MS;
     let mut color_mode = ColorMode::Default;
@@ -362,16 +379,16 @@ fn parse_args() -> anyhow::Result<Config> {
     let mut deepcool_update_ms = DEFAULT_DEEPCOOL_UPDATE_MS;
     let mut screenshot_key: Option<(u32, String)> = None;
     let mut rotation = Rotation::Deg0;
-    let mut classic = false;
-    let mut no_audio = false;
-    let mut inferrig_url: Option<String> = Some("http://127.0.0.1:5577".to_string());
+    let mut profile = None;
+    let mut audio = None;
+    let mut inferrig_url = None;
+    let mut inferrig_enabled = true;
     let mut hid_rotate: Option<u32> = None;
 
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--idle-fps" => idle_fps = next_f32(&mut args, "--idle-fps")?,
-            "--active-fps" => active_fps = next_f32(&mut args, "--active-fps")?,
+            "--idle-fps" => idle_fps = Some(next_f32(&mut args, "--idle-fps")?),
+            "--active-fps" => active_fps = Some(next_f32(&mut args, "--active-fps")?),
             "--silence-threshold" => {
                 silence_threshold = next_f32(&mut args, "--silence-threshold")?
             }
@@ -437,9 +454,31 @@ fn parse_args() -> anyhow::Result<Config> {
                 })?;
                 rotation = parse_rotation(deg)?;
             }
-            "--classic" => classic = true,
-            "--no-audio" => no_audio = true,
-            "--no-inferrig" => inferrig_url = None,
+            "--config" => {
+                config_path =
+                    Some(std::path::PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--config requires a path")
+                    })?))
+            }
+            "--profile" => {
+                profile = Some(match args.next().as_deref() {
+                    Some("grid") => Profile::Grid,
+                    Some("classic") => Profile::Classic,
+                    Some("inference") => Profile::Inference,
+                    _ => anyhow::bail!("--profile requires grid, inference or classic"),
+                })
+            }
+            "--theme" => {
+                theme = Some(match args.next().as_deref() {
+                    Some("standard") => Theme::Standard,
+                    Some("terminal") => Theme::Terminal,
+                    _ => anyhow::bail!("--theme requires standard or terminal"),
+                })
+            }
+            "--classic" => profile = Some(Profile::Classic),
+            "--audio" => audio = Some(true),
+            "--no-audio" => audio = Some(false),
+            "--no-inferrig" => inferrig_enabled = false,
             "--inferrig-url" => {
                 let raw = args.next().ok_or_else(|| {
                     anyhow::anyhow!("--inferrig-url butuh satu nilai setelahnya")
@@ -471,7 +510,39 @@ fn parse_args() -> anyhow::Result<Config> {
         }
     }
 
-    if !(idle_fps > 0.0) || !(active_fps > 0.0) {
+    let file = settings::load(config_path.as_deref())?;
+    let profile = profile.or(file.profile).unwrap_or_default();
+    let inference = profile == Profile::Inference;
+    let theme = theme.or(file.theme).unwrap_or(if inference {
+        Theme::Terminal
+    } else {
+        Theme::Standard
+    });
+    let no_audio = !audio.or(file.audio).unwrap_or(!inference);
+    let idle_fps =
+        idle_fps
+            .or(file.idle_fps)
+            .unwrap_or(if inference { 3.0 } else { DEFAULT_IDLE_FPS });
+    let active_fps = active_fps.or(file.active_fps).unwrap_or(DEFAULT_ACTIVE_FPS);
+    let inferrig_url = if inference && inferrig_enabled {
+        Some(inferrig::base_url(
+            inferrig_url
+                .or(file.inferrig_url)
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:5577"),
+        )?)
+    } else {
+        None
+    };
+    let net_peak_half_life_secs =
+        file.net_peak_half_life_secs
+            .unwrap_or(if inference { 2.0 } else { 0.0 });
+    if !net_peak_half_life_secs.is_finite() || net_peak_half_life_secs < 0.0 {
+        anyhow::bail!("net_peak_half_life_secs must be finite and nonnegative");
+    }
+    if [idle_fps, active_fps].iter().any(|fps| {
+        !fps.is_finite() || *fps <= 0.0 || Duration::try_from_secs_f32(1.0 / fps).is_err()
+    }) {
         anyhow::bail!("--idle-fps dan --active-fps harus berupa angka > 0");
     }
     if openrgb_poll_ms == 0 {
@@ -496,7 +567,9 @@ fn parse_args() -> anyhow::Result<Config> {
         deepcool_update_ms,
         screenshot_key,
         rotation,
-        classic,
+        profile,
+        theme,
+        net_peak_half_life_secs,
         no_audio,
         inferrig_url,
         hid_rotate,
@@ -555,61 +628,15 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Deteksi layar: coba dulu varian bulk "LY" (0416:5408/5409 — Trofeo
-    // Vision 9.16 revisi lama), kalau tidak ada fallback ke varian HID
-    // (0416:5302 "Winbond USBDISPLAY" — firmware revisi baru, mis. unit
-    // Trofeo Vision lain; protokol HID report 512-byte, lihat src/hid_lcd.rs).
-    enum Screen {
-        Ly(LyLcd),
-        Hid(HidLcd),
-    }
-    impl Screen {
-        fn resolution(&self) -> Resolution {
-            match self {
-                Screen::Ly(_) => TROFEO_VISION_9_16,
-                Screen::Hid(lcd) => lcd.resolution(),
-            }
-        }
-
-        fn send_framebuffer(
-            &self,
-            fb: &Framebuffer,
-            quality: u8,
-            rotation: Rotation,
-        ) -> anyhow::Result<()> {
-            match self {
-                Screen::Ly(lcd) => Ok(lcd.send_framebuffer(fb, quality, rotation)?),
-                Screen::Hid(lcd) => Ok(lcd.send_framebuffer(fb, quality, rotation)?),
-            }
-        }
-    }
-
-    let screen = match LyLcd::open() {
-        Ok(lcd) => {
-            let hs = lcd.handshake()?;
-            println!(
-                "Terhubung (LY bulk, {:?}): PM={} SUB={}",
-                lcd.variant(),
-                hs.pm,
-                hs.sub
-            );
-            Screen::Ly(lcd)
-        }
-        Err(ly_err) => {
-            println!(
-                "Perangkat LY bulk tidak ditemukan ({ly_err}); coba varian HID 0416:5302…"
-            );
-            let lcd = HidLcd::open(config.hid_rotate).map_err(|e| {
-                anyhow::anyhow!("tidak ada layar Thermalright (LY maupun HID) yang bisa dibuka: {e}")
-            })?;
-            let hs = lcd.handshake_info();
-            println!(
-                "Terhubung (HID 0416:5302): PM={} SUB={} → {}x{}, rotasi wire {}°",
-                hs.pm, hs.sub, hs.width, hs.height, hs.wire_rotation
-            );
-            Screen::Hid(lcd)
-        }
-    };
+    println!(
+        "Profile {:?}, theme {:?}, audio {}, idle/active FPS {}/{}",
+        config.profile,
+        config.theme,
+        if config.no_audio { "off" } else { "on" },
+        config.idle_fps,
+        config.active_fps
+    );
+    let screen = Screen::open(config.hid_rotate)?;
     let resolution = screen.resolution();
     println!("Resolusi framebuffer: {}x{}", resolution.width, resolution.height);
     println!(
@@ -669,7 +696,7 @@ fn main() -> anyhow::Result<()> {
     // Pembaca frekuensi CPU real-time (PDH di Windows, sysfs cpufreq di
     // Linux) — lihat cpu_freq.rs. Graceful: kalau gagal, baris info / panel
     // CPU menampilkan N/A.
-    let cpu_freq = cpu_freq::CpuFreq::new();
+    let cpu_freq = (config.profile != Profile::Inference).then(cpu_freq::CpuFreq::new);
 
     // Hotkey tangkapan layar LCD (global, default NONAKTIF — aktif hanya
     // kalau argumen --screenshot-key diberikan). Frame yang disimpan adalah
@@ -693,12 +720,8 @@ fn main() -> anyhow::Result<()> {
     let gpu_amd = gpu_amd::GpuAmdSensor::new();
     let mut latest_gpu_data = gpu_amd::GpuAmdData::default();
 
-    let audio_ring = if config.no_audio {
-        println!("Audio: dinonaktifkan (--no-audio) — tanpa capture, volume, dan now-playing.");
-        audio::dummy_ring()
-    } else {
-        audio::spawn_capture()?
-    };
+    let audio_ring = (!config.no_audio).then(audio::spawn_capture).transpose()?;
+    let show_media = !config.no_audio && config.profile != Profile::Inference;
 
     // Background dimuat SEKALI di sini: decode + cover-crop + pencarian
     // quality JPEG_relative mahal (~1 detik), tidak boleh diulang tiap frame.
@@ -741,20 +764,16 @@ fn main() -> anyhow::Result<()> {
     if gpu_monitor.is_none() {
         eprintln!("PERINGATAN: GPU usage tidak tersedia di sistem ini, baris info akan menampilkan N/A.");
     }
-    let mut netdisk_monitor = netdisk::NetDiskMonitor::new();
-    let audio_endpoint = if config.no_audio {
-        None
-    } else {
-        media::AudioMonitor::new().ok()
-    };
-    if audio_endpoint.is_none() {
-        eprintln!("PERINGATAN: volume master tidak terbaca, baris info akan menampilkan N/A.");
+    let mut netdisk_monitor = netdisk::NetDiskMonitor::new(config.profile != Profile::Inference);
+    let audio_endpoint = show_media
+        .then(media::AudioMonitor::new)
+        .and_then(Result::ok);
+    if show_media && audio_endpoint.is_none() {
+        eprintln!("Volume unavailable");
     }
-    let now_playing: media::SharedNowPlaying = if config.no_audio {
-        Arc::new(Mutex::new(None))
-    } else {
-        media::spawn_now_playing_watcher()?
-    };
+    let now_playing = show_media
+        .then(media::spawn_now_playing_watcher)
+        .transpose()?;
     let mut now_playing_marquee = Marquee::new();
     // Marquee terpisah untuk tanggal di portrait: state tidak boleh bercampur
     // dengan judul lagu yang juga sedang scroll.
@@ -763,24 +782,15 @@ fn main() -> anyhow::Result<()> {
     // Panel AI INFERENCE: polling status + telemetry InferRig (control plane
     // llama.cpp) di thread background — kalau servernya mati, panel cuma
     // menampilkan OFFLINE, program tetap jalan.
-    let inferrig_state = config.inferrig_url.as_ref().map(|url| {
-        println!(
-            "InferRig: polling {url} tiap {} ms",
-            inferrig::DEFAULT_POLL_INTERVAL.as_millis()
-        );
-        inferrig::spawn(url.clone(), inferrig::DEFAULT_POLL_INTERVAL)
-    });
-    let offline_ai = inferrig::InferrigState::default();
-
+    let inferrig_state = config
+        .inferrig_url
+        .clone()
+        .map(inferrig::spawn)
+        .transpose()?;
     let mut latest_gpu_percent: Option<f32> = None;
-    let mut latest_net_kb = (0.0f64, 0.0f64); // (down, up)
-    // Peak-hold kecepatan NET: naik instan ke nilai terbaru, turun pelan
-    // (decay eksponensial per refresh). Burst unduhan yang cuma berlangsung
-    // 1-3 detik (file beberapa MB pada 25+ MB/s) selesai sebelum mata sempat
-    // melirik layar yang refresh-nya 500 ms / 3 FPS — dengan peak-hold,
-    // nilai puncaknya tetap terlihat turun perlahan beberapa detik.
+    let mut latest_net_kb = (0.0f64, 0.0f64);
     let mut net_peak_kb = (0.0f64, 0.0f64);
-    const NET_PEAK_DECAY: f64 = 0.85; // per 500 ms → ~10 detik sampai ~4%
+    let show_peak = config.profile == Profile::Inference && config.net_peak_half_life_secs > 0.0;
     let mut latest_disk_mb = (0.0f64, 0.0f64); // (read, write)
     let mut latest_volume: Option<(f32, bool)> = None; // (percent, muted)
     let mut latest_cpu_temp: Option<f32> = None; // °C
@@ -791,15 +801,20 @@ fn main() -> anyhow::Result<()> {
     sys.refresh_all();
     let mut last_sysinfo_refresh = Instant::now();
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(FFT_SIZE);
-    let hann = hann_window(FFT_SIZE);
-    let bar_bins = precompute_bar_bins(FFT_SIZE);
+    let spectrum = show_media.then(|| {
+        (
+            FftPlanner::new().plan_fft_forward(FFT_SIZE),
+            hann_window(FFT_SIZE),
+            precompute_bar_bins(FFT_SIZE),
+        )
+    });
 
     let mut bar_heights = vec![0f32; NUM_BARS];
     let mut running_max: f32 = 1e-6;
 
     let mut fb = Framebuffer::new(resolution);
+    let mut portrait_buffer = is_portrait(config.rotation)
+        .then(|| Framebuffer::new(Resolution::new(resolution.height, resolution.width)));
 
     // Kapan terakhir kali ada suara (bukan diam) terdeteksi. Diinisialisasi
     // ke "baru saja" supaya program mulai di `active_fps` (grace period
@@ -828,11 +843,16 @@ fn main() -> anyhow::Result<()> {
         }
 
         // 1) Ambil window audio terbaru, cek apakah lagi diam, & hitung spektrum.
-        let samples = audio::take_latest(&audio_ring, FFT_SIZE);
-        if !is_silent(&samples, config.silence_threshold) {
+        let samples = audio_ring
+            .as_ref()
+            .map(|ring| audio::take_latest(ring, FFT_SIZE));
+        if samples
+            .as_ref()
+            .is_some_and(|s| !is_silent(s, config.silence_threshold))
+        {
             last_sound = Instant::now();
         }
-        let is_idle = last_sound.elapsed() >= config.silence_timeout;
+        let is_idle = audio_ring.is_none() || last_sound.elapsed() >= config.silence_timeout;
         let target_fps = if is_idle {
             config.idle_fps
         } else {
@@ -840,12 +860,14 @@ fn main() -> anyhow::Result<()> {
         };
         let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
 
-        let bars = compute_bars(&samples, &hann, fft.as_ref(), &bar_bins, &mut running_max);
-        for (h, &target) in bar_heights.iter_mut().zip(bars.iter()) {
-            if target > *h {
-                *h = target; // attack cepat
-            } else {
-                *h = *h * 0.75 + target * 0.25; // decay lebih pelan
+        if let (Some(samples), Some((fft, hann, bar_bins))) = (&samples, &spectrum) {
+            let bars = compute_bars(samples, hann, fft.as_ref(), bar_bins, &mut running_max);
+            for (h, &target) in bar_heights.iter_mut().zip(bars.iter()) {
+                if target > *h {
+                    *h = target; // attack cepat
+                } else {
+                    *h = *h * 0.75 + target * 0.25; // decay lebih pelan
+                }
             }
         }
 
@@ -866,9 +888,14 @@ fn main() -> anyhow::Result<()> {
             }
             let (down, up, read, write) = netdisk_monitor.sample();
             latest_net_kb = (down, up);
-            // Peak-hold (lihat komentar deklarasi `net_peak_kb`).
-            net_peak_kb.0 = latest_net_kb.0.max(net_peak_kb.0 * NET_PEAK_DECAY);
-            net_peak_kb.1 = latest_net_kb.1.max(net_peak_kb.1 * NET_PEAK_DECAY);
+            if show_peak {
+                let decay =
+                    0.5_f64.powf(sysinfo_delta_ms as f64 / 1000.0 / config.net_peak_half_life_secs);
+                net_peak_kb = (
+                    down.max(net_peak_kb.0 * decay),
+                    up.max(net_peak_kb.1 * decay),
+                );
+            }
             latest_disk_mb = (read, write);
             if let Some(audio_ep) = audio_endpoint.as_ref() {
                 latest_volume = audio_ep.sample().ok();
@@ -883,7 +910,7 @@ fn main() -> anyhow::Result<()> {
             drop(sensor);
 
             // Frekuensi CPU real-time (lihat cpu_freq.rs).
-            latest_cpu_mhz = cpu_freq.sample_mhz();
+            latest_cpu_mhz = cpu_freq.as_ref().and_then(|reader| reader.sample_mhz());
 
             // Sensor GPU AMD: suhu Edge, ASIC power, fan RPM via ADL PMLog.
             latest_gpu_data = gpu_amd.sample();
@@ -897,12 +924,10 @@ fn main() -> anyhow::Result<()> {
         // usage lagi tinggi (indikasi lagi main game), diganti nama program
         // .exe yang sedang jadi foreground window (mis. nama game itu
         // sendiri) — lebih berguna daripada judul lagu background saat main.
-        let now_playing_title = if gaming_mode {
-            foreground::foreground_exe_name()
-                .or_else(|| now_playing.lock().ok().and_then(|g| g.clone()))
-        } else {
-            now_playing.lock().ok().and_then(|g| g.clone())
-        };
+        let now_playing_title = now_playing.as_ref().and_then(|media| {
+            let foreground = gaming_mode.then(foreground::foreground_exe_name).flatten();
+            foreground.or_else(|| media.lock().ok().and_then(|title| title.clone()))
+        });
 
         // 3) Gambar (pakai kembali framebuffer yang sama, cuma di-clear).
         // Saat lagi diam (idle) bar EQ nggak ada gunanya digambar rata
@@ -921,41 +946,51 @@ fn main() -> anyhow::Result<()> {
             None => config.color_mode,
         };
 
-        // Snapshot data InferRig terbaru untuk frame ini (clone murah; kalau
-        // polling dimatikan, pakai state offline statis).
-        let ai_snapshot = inferrig_state.as_ref().map(inferrig::snapshot);
-        let ai = ai_snapshot.as_ref().unwrap_or(&offline_ai);
-
-        apply_background(&mut fb, background.as_ref(), false);
-
-        if is_portrait(config.rotation) {
-            let mut portrait_fb = Framebuffer::new(Resolution::new(
-                resolution.height,
-                resolution.width,
-            ));
-            apply_background(&mut portrait_fb, background.as_ref(), true);
-
-            if config.classic {
+        let canvas = portrait_buffer.as_mut().unwrap_or(&mut fb);
+        apply_background(canvas, background.as_ref(), is_portrait(config.rotation));
+        let palette = Palette::new(config.theme, color_mode);
+        let readings = Readings {
+            sys: &sys,
+            gpu: &latest_gpu_data,
+            gpu_percent: latest_gpu_percent,
+            cpu_temp: latest_cpu_temp,
+            cpu_power: latest_cpu_power,
+            cpu_mhz: latest_cpu_mhz,
+            net: if show_peak {
+                net_peak_kb
+            } else {
+                latest_net_kb
+            },
+            disk: latest_disk_mb,
+            volume: latest_volume,
+        };
+        match config.profile {
+            Profile::Classic => {
                 if gaming_mode {
                     draw_game_dashboard(
-                        &mut portrait_fb,
+                        canvas,
                         &sys,
-                        background.as_ref(),
                         latest_gpu_percent,
                         &latest_gpu_data,
                         latest_cpu_temp,
                         latest_cpu_power,
                         latest_cpu_mhz,
-                        color_mode,
+                        palette,
                         config.rotation,
                     );
                 } else if is_idle {
-                    draw_idle_clock(&mut portrait_fb, color_mode, config.rotation, &mut date_marquee, background.as_ref());
+                    draw_idle_clock(
+                        canvas,
+                        palette.clock(color_mode),
+                        config.rotation,
+                        &mut date_marquee,
+                        background.as_ref(),
+                    );
                 } else {
-                    draw_bars(&mut portrait_fb, &bar_heights, color_mode, config.rotation, background.as_ref());
+                    draw_bars(canvas, &bar_heights, color_mode, config.rotation);
                 }
                 draw_status_lines(
-                    &mut portrait_fb,
+                    canvas,
                     &sys,
                     background.as_ref(),
                     latest_gpu_percent,
@@ -970,79 +1005,38 @@ fn main() -> anyhow::Result<()> {
                     &mut now_playing_marquee,
                     config.rotation,
                 );
-            } else {
-                draw_grid_layout(
-                    &mut portrait_fb,
-                    &sys,
-                    latest_gpu_percent,
-                    &latest_gpu_data,
-                    net_peak_kb,
-                    latest_cpu_temp,
-                    latest_cpu_power,
-                    ai,
+            }
+            Profile::Grid => grid::draw(
+                canvas,
+                &readings,
+                now_playing_title.as_deref(),
+                &mut now_playing_marquee,
+                color_mode,
+                palette,
+                config.rotation,
+                &bar_heights,
+            ),
+            Profile::Inference => {
+                let ai = inferrig_state
+                    .as_ref()
+                    .map(|shared| shared.lock().unwrap().clone());
+                draw_inference(
+                    canvas,
+                    &readings,
+                    show_peak,
+                    ai.as_ref(),
                     &mut now_playing_marquee,
-                    color_mode,
+                    palette,
                     config.rotation,
                 );
             }
-
-            let rotated = match config.rotation {
-                Rotation::Deg90 => portrait_fb.rotated_270(),
-                Rotation::Deg270 => portrait_fb.rotated_90(),
+        }
+        if let Some(canvas) = &portrait_buffer {
+            fb = match config.rotation {
+                Rotation::Deg90 => canvas.rotated_270(),
+                Rotation::Deg270 => canvas.rotated_90(),
                 _ => unreachable!(),
             };
-            fb.as_bytes_mut().copy_from_slice(rotated.as_bytes());
-        } else {
-            if config.classic {
-                if gaming_mode {
-                    draw_game_dashboard(
-                        &mut fb,
-                        &sys,
-                        background.as_ref(),
-                        latest_gpu_percent,
-                        &latest_gpu_data,
-                        latest_cpu_temp,
-                        latest_cpu_power,
-                        latest_cpu_mhz,
-                        color_mode,
-                        config.rotation,
-                    );
-                } else if is_idle {
-                    draw_idle_clock(&mut fb, color_mode, config.rotation, &mut date_marquee, background.as_ref());
-                } else {
-                    draw_bars(&mut fb, &bar_heights, color_mode, config.rotation, background.as_ref());
-                }
-                draw_status_lines(
-                    &mut fb,
-                    &sys,
-                    background.as_ref(),
-                    latest_gpu_percent,
-                    &latest_gpu_data,
-                    latest_net_kb,
-                    latest_disk_mb,
-                    latest_volume,
-                    latest_cpu_temp,
-                    latest_cpu_power,
-                    latest_cpu_mhz,
-                    now_playing_title.as_deref(),
-                    &mut now_playing_marquee,
-                    config.rotation,
-                );
-            } else {
-                draw_grid_layout(
-                    &mut fb,
-                    &sys,
-                    latest_gpu_percent,
-                    &latest_gpu_data,
-                    net_peak_kb,
-                    latest_cpu_temp,
-                    latest_cpu_power,
-                    ai,
-                    &mut now_playing_marquee,
-                    color_mode,
-                    config.rotation,
-                );
-            }
         }
 
         // 4) Kirim ke layar.
@@ -1137,13 +1131,7 @@ fn compute_bars(
     bars
 }
 
-fn draw_bars(
-    fb: &mut Framebuffer,
-    heights: &[f32],
-    color_mode: ColorMode,
-    rotation: Rotation,
-    bg: Option<&background::Background>,
-) {
+fn draw_bars(fb: &mut Framebuffer, heights: &[f32], color_mode: ColorMode, rotation: Rotation) {
     let width = fb.width();
     let height = fb.height();
 
@@ -1190,459 +1178,6 @@ fn draw_bars(
     }
 }
 
-/// Palet warna bersama semua panel dashboard (border, latar, label, nilai,
-/// ketebalan bingkai).
-#[derive(Clone, Copy)]
-struct Palette {
-    border: (u8, u8, u8),
-    panel_bg: (u8, u8, u8),
-    label_color: (u8, u8, u8),
-    value_color: (u8, u8, u8),
-    border_thickness: u32,
-}
-
-/// Bingkai panel standar: border luar, latar gelap, label kecil di tengah
-/// atas, garis pemisah di bawah label. Mengembalikan area dalam panel
-/// `(x, y, w, h)` — MULAI dari garis pemisah (cell yang digambar di area
-/// ini sebaiknya menggambar border atasnya sendiri supaya menyatu).
-fn draw_panel_chrome(
-    fb: &mut Framebuffer,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    label: &str,
-    p: Palette,
-    label_scale: u32,
-) -> (u32, u32, u32, u32) {
-    let bt = p.border_thickness;
-    fb.fill_rect(x, y, w, h, p.border.0, p.border.1, p.border.2);
-    fb.fill_rect(
-        x + bt,
-        y + bt,
-        w.saturating_sub(bt * 2),
-        h.saturating_sub(bt * 2),
-        p.panel_bg.0,
-        p.panel_bg.1,
-        p.panel_bg.2,
-    );
-
-    let lw = Framebuffer::text_width(label, label_scale);
-    let lx = x + (w.saturating_sub(lw)) / 2;
-    let ly = y + bt + 4;
-    fb.draw_text(lx, ly, label, p.label_color.0, p.label_color.1, p.label_color.2, label_scale);
-
-    let divider_y = ly + Framebuffer::text_height(label_scale) + 4;
-    fb.fill_rect(
-        x + bt,
-        divider_y,
-        w.saturating_sub(bt * 2),
-        bt,
-        p.border.0,
-        p.border.1,
-        p.border.2,
-    );
-
-    (x, divider_y, w, (y + h).saturating_sub(divider_y))
-}
-
-/// Nilai besar di tengah kotak berbingkai (dengan auto-fit skala teks).
-fn draw_big_value(
-    fb: &mut Framebuffer,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    value: &str,
-    p: Palette,
-    max_scale: u32,
-) {
-    let bt = p.border_thickness;
-    fb.fill_rect(x, y, w, h, p.border.0, p.border.1, p.border.2);
-    fb.fill_rect(
-        x + bt,
-        y + bt,
-        w.saturating_sub(bt * 2),
-        h.saturating_sub(bt * 2),
-        p.panel_bg.0,
-        p.panel_bg.1,
-        p.panel_bg.2,
-    );
-
-    let vs = fit_text_scale(value, w.saturating_sub(bt * 2 + 4), max_scale);
-    let vw = Framebuffer::text_width(value, vs);
-    let vx = x + (w.saturating_sub(vw)) / 2;
-    let vy = y + (h.saturating_sub(Framebuffer::text_height(vs))) / 2;
-    fb.draw_text(vx, vy, value, p.value_color.0, p.value_color.1, p.value_color.2, vs);
-}
-
-/// Sel metrik berbingkai: label kecil di tengah atas, nilai besar di tengah
-/// (auto-fit), dan unit opsional di bawah nilai (mis. "T/S", "KB/S").
-fn draw_metric_cell(
-    fb: &mut Framebuffer,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    label: &str,
-    value: &str,
-    unit: Option<&str>,
-    p: Palette,
-    value_scale: u32,
-    detail_scale: u32,
-) {
-    let bt = p.border_thickness;
-    fb.fill_rect(x, y, w, h, p.border.0, p.border.1, p.border.2);
-    fb.fill_rect(
-        x + bt,
-        y + bt,
-        w.saturating_sub(bt * 2),
-        h.saturating_sub(bt * 2),
-        p.panel_bg.0,
-        p.panel_bg.1,
-        p.panel_bg.2,
-    );
-
-    let lab_scale = fit_text_scale(label, w.saturating_sub(bt * 2), detail_scale);
-    let lw = Framebuffer::text_width(label, lab_scale);
-    let lx = x + (w.saturating_sub(lw)) / 2;
-    let ly = y + bt + 2;
-    fb.draw_text(lx, ly, label, p.label_color.0, p.label_color.1, p.label_color.2, lab_scale);
-
-    let val_scale = fit_text_scale(value, w.saturating_sub(bt * 2 + 4), value_scale);
-    let vh = Framebuffer::text_height(val_scale);
-    let v_top = ly + Framebuffer::text_height(lab_scale) + 4;
-    let v_bottom = (y + h).saturating_sub(bt + 2);
-
-    match unit {
-        Some(u) => {
-            let u_scale = fit_text_scale(u, w.saturating_sub(bt * 2 + 4), detail_scale);
-            let uh = Framebuffer::text_height(u_scale);
-            let block_h = vh + 4 + uh;
-            let by = v_top + v_bottom.saturating_sub(v_top + block_h) / 2;
-            let vw = Framebuffer::text_width(value, val_scale);
-            let vx = x + (w.saturating_sub(vw)) / 2;
-            fb.draw_text(vx, by, value, p.value_color.0, p.value_color.1, p.value_color.2, val_scale);
-            let uw = Framebuffer::text_width(u, u_scale);
-            let ux = x + (w.saturating_sub(uw)) / 2;
-            fb.draw_text(ux, by + vh + 4, u, p.label_color.0, p.label_color.1, p.label_color.2, u_scale);
-        }
-        None => {
-            let vy = v_top + v_bottom.saturating_sub(v_top + vh) / 2;
-            let vw = Framebuffer::text_width(value, val_scale);
-            let vx = x + (w.saturating_sub(vw)) / 2;
-            fb.draw_text(vx, vy, value, p.value_color.0, p.value_color.1, p.value_color.2, val_scale);
-        }
-    }
-}
-
-/// Format kecepatan jaringan: di bawah 1024 → KB/S bulat, di atasnya
-/// MB/S dengan satu desimal.
-fn fmt_net_speed(kb_s: f64) -> (String, &'static str) {
-    if kb_s >= 1024.0 {
-        (format!("{:.1}", kb_s / 1024.0), "MB/S")
-    } else {
-        (format!("{:.0}", kb_s), "KB/S")
-    }
-}
-
-/// Panel metrik (CPU / GPU / MEM): label + nilai besar (mis. persentase) +
-/// dua sel kecil di bawahnya (mis. TEMP | WATT).
-fn draw_metric_panel(
-    fb: &mut Framebuffer,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    label: &str,
-    big_value: &str,
-    cells: &[(&str, String); 2],
-    p: Palette,
-    value_scale: u32,
-    detail_scale: u32,
-) {
-    let (ix, iy, iw, ih) = draw_panel_chrome(fb, x, y, w, h, label, p, 3);
-    let bt = p.border_thickness;
-
-    let big_h = ih * 45 / 100;
-    draw_big_value(fb, ix, iy, iw, big_h, big_value, p, value_scale);
-
-    let cells_y = iy + big_h.saturating_sub(bt);
-    let cells_h = (iy + ih).saturating_sub(cells_y);
-    let cw = (iw + bt) / 2;
-    // Skala nilai sel kecil dikurangi supaya ada jarak vertikal dari label
-    // (di panel 1/3 tinggi, nilai skala penuh menempel persis di bawah label).
-    let cell_value_scale = value_scale.saturating_sub(2);
-    for (c, (cl, cv)) in cells.iter().enumerate() {
-        let cx = ix + c as u32 * cw.saturating_sub(bt);
-        let cww = if c == 1 { (ix + iw).saturating_sub(cx) } else { cw };
-        draw_metric_cell(fb, cx, cells_y, cww, cells_h, cl, cv, None, p, cell_value_scale, detail_scale);
-    }
-}
-
-/// Panel NET: dua sel selebar area dalam (DL | UP), masing-masing dengan unit.
-fn draw_net_panel(
-    fb: &mut Framebuffer,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    dl: (&str, String, &'static str),
-    up: (&str, String, &'static str),
-    p: Palette,
-    value_scale: u32,
-    detail_scale: u32,
-) {
-    let (ix, iy, iw, ih) = draw_panel_chrome(fb, x, y, w, h, "NET", p, 3);
-    let bt = p.border_thickness;
-    let cw = (iw + bt) / 2;
-    // Nilai DL/UP sedikit lebih kecil dari nilai besar panel lain — tetap
-    // terbaca, tapi tidak menempel ke labelnya.
-    let cell_value_scale = value_scale.saturating_sub(1);
-    draw_metric_cell(fb, ix, iy, cw, ih, dl.0, &dl.1, Some(dl.2), p, cell_value_scale, detail_scale);
-    let up_x = ix + cw.saturating_sub(bt);
-    let up_w = (ix + iw).saturating_sub(up_x);
-    draw_metric_cell(fb, up_x, iy, up_w, ih, up.0, &up.1, Some(up.2), p, cell_value_scale, detail_scale);
-}
-
-/// Panel AI INFERENCE: baris model+status (marquee) di atas, lalu sel-sel
-/// metrik inferensi. Layout sel: 4 sebaris kalau lebar, 2x2 kalau sempit.
-fn draw_ai_panel(
-    fb: &mut Framebuffer,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    ai: &inferrig::InferrigState,
-    marquee: &mut Marquee,
-    p: Palette,
-    value_scale: u32,
-    detail_scale: u32,
-) {
-    let (ix, iy, iw, ih) = draw_panel_chrome(fb, x, y, w, h, "AI INFERENCE", p, 3);
-    let bt = p.border_thickness;
-    let song_scale = 3u32;
-
-    // ── Baris model + state ──
-    let model_area_h = Framebuffer::text_height(song_scale) + bt * 2 + 24;
-    let cells_area_h = ih.saturating_sub(model_area_h).saturating_sub(bt);
-
-    fb.fill_rect(ix, iy, iw, model_area_h, p.border.0, p.border.1, p.border.2);
-    fb.fill_rect(
-        ix + bt,
-        iy + bt,
-        iw.saturating_sub(bt * 2),
-        model_area_h.saturating_sub(bt * 2),
-        p.panel_bg.0,
-        p.panel_bg.1,
-        p.panel_bg.2,
-    );
-
-    let (model_text, m_color) = if ai.online() {
-        (format!("{} [{}]", ai.model, ai.state), p.value_color)
-    } else {
-        ("INFERRIG OFFLINE".to_string(), p.label_color)
-    };
-    let clip_x0 = ix + bt + 4;
-    let clip_x1 = (ix + iw).saturating_sub(bt + 4);
-    let available_width = clip_x1.saturating_sub(clip_x0);
-    let text_h = Framebuffer::text_height(song_scale);
-    let text_y = iy + bt + (model_area_h.saturating_sub(bt + text_h)) / 2;
-    if available_width > 0 && marquee.tick(&model_text, available_width, song_scale) {
-        let loop_text = format!("{}{}", model_text, MARQUEE_GAP);
-        let loop_width = Framebuffer::text_width(&loop_text, song_scale) as i64;
-        let base_x = clip_x0 as i64 - marquee.offset_px as i64;
-        fb.draw_text_clipped(base_x, text_y, &loop_text, m_color.0, m_color.1, m_color.2, song_scale, clip_x0, clip_x1);
-        fb.draw_text_clipped(base_x + loop_width, text_y, &loop_text, m_color.0, m_color.1, m_color.2, song_scale, clip_x0, clip_x1);
-    } else {
-        let tw = Framebuffer::text_width(&model_text, song_scale);
-        let tx = ix + (iw.saturating_sub(tw)) / 2;
-        fb.draw_text(tx, text_y, &model_text, m_color.0, m_color.1, m_color.2, song_scale);
-    }
-
-    // ── Sel metrik ──
-    let online = ai.online();
-    let cells: [(&str, String, &str); 4] = [
-        ("GEN", if online { format!("{:.1}", ai.gen_tps) } else { "N/A".to_string() }, "T/S"),
-        ("PROMPT", if online { format!("{:.1}", ai.prompt_tps) } else { "N/A".to_string() }, "T/S"),
-        (
-            "REQ",
-            if online {
-                format!("{}+{}", ai.requests_active, ai.requests_queued)
-            } else {
-                "N/A".to_string()
-            },
-            "",
-        ),
-        (
-            "VRAM",
-            if online {
-                format!("{:.1}", ai.gpu_mem_used_bytes / 1024.0 / 1024.0 / 1024.0)
-            } else {
-                "N/A".to_string()
-            },
-            "G",
-        ),
-    ];
-
-    let cells_y = iy + model_area_h;
-    let wide = iw >= 900;
-    let (cols, rows): (u32, u32) = if wide { (4, 1) } else { (2, 2) };
-    let cw = (iw + bt * (cols - 1)) / cols;
-    let ch = (cells_area_h + bt * (rows - 1)) / rows;
-    let cell_value_scale = value_scale.saturating_sub(1);
-    for (i, (label, value, unit)) in cells.iter().enumerate() {
-        let col = (i as u32) % cols;
-        let row = (i as u32) / cols;
-        let cx = ix + col * cw.saturating_sub(bt);
-        let cy = cells_y + row * ch.saturating_sub(bt);
-        let cww = if col + 1 == cols { (ix + iw).saturating_sub(cx) } else { cw };
-        let chh = if row + 1 == rows { (iy + ih).saturating_sub(cy) } else { ch };
-        let unit = if unit.is_empty() { None } else { Some(*unit) };
-        draw_metric_cell(fb, cx, cy, cww, chh, label, value, unit, p, cell_value_scale, detail_scale);
-    }
-}
-
-/// Layout grid (default). Baris atas: 4 panel sederhana CPU | GPU | MEM | NET.
-/// Baris bawah: satu panel AI INFERENCE selebar layar. Portrait: 4 panel
-/// bertumpuk vertikal + AI di bawah.
-fn draw_grid_layout(
-    fb: &mut Framebuffer,
-    sys: &System,
-    gpu_percent: Option<f32>,
-    gpu_data: &gpu_amd::GpuAmdData,
-    net_kb: (f64, f64),
-    cpu_temp: Option<f32>,
-    cpu_power: Option<f32>,
-    ai: &inferrig::InferrigState,
-    marquee: &mut Marquee,
-    color_mode: ColorMode,
-    rotation: Rotation,
-) {
-    let width = fb.width();
-    let height = fb.height();
-
-    let top_margin = 10u32;
-    let bottom_margin = 10u32;
-    let area_top = top_margin;
-    let area_height = height.saturating_sub(top_margin + bottom_margin);
-
-    let p = Palette {
-        border: accent_color(color_mode),
-        panel_bg: (0x14, 0x14, 0x1C),
-        label_color: (0xA0, 0xA0, 0xA8),
-        value_color: (0x00, 0xE0, 0x64),
-        border_thickness: 4,
-    };
-    let value_scale = 5u32;
-    let detail_scale = 3u32;
-
-    let cpu = sys.global_cpu_info().cpu_usage();
-    // Memori dalam GiB utuh, dibulatkan ke ATAS (34.1G dan 34.7G -> 35G).
-    let used_gb = (sys.used_memory() as f64 / 1073741824.0).ceil() as u64;
-    let total_gb = (sys.total_memory() as f64 / 1073741824.0).ceil() as u64;
-    let mem_pct = if sys.total_memory() > 0 {
-        (sys.used_memory() as f32 / sys.total_memory() as f32) * 100.0
-    } else {
-        0.0
-    };
-
-    let gpu_str = match gpu_percent {
-        Some(v) => format!("{v:.0}%"),
-        None => "N/A".to_string(),
-    };
-    let cpu_temp_str = cpu_temp.map_or_else(|| "N/A".to_string(), |t| format!("{t:.0}C"));
-    let cpu_watt_str = cpu_power.map_or_else(|| "N/A".to_string(), |w| format!("{w:.0}W"));
-    let gpu_temp_str = gpu_data
-        .temp_edge_c
-        .map_or_else(|| "N/A".to_string(), |t| format!("{t:.0}C"));
-    let gpu_watt_str = gpu_data
-        .power_w
-        .map_or_else(|| "N/A".to_string(), |w| format!("{w:.0}W"));
-
-    let (net_down, net_up) = net_kb;
-    let (dl_val, dl_unit) = fmt_net_speed(net_down);
-    let (up_val, up_unit) = fmt_net_speed(net_up);
-
-    let metric_panels: [(&str, String, [(&str, String); 2]); 3] = [
-        (
-            "CPU",
-            format!("{cpu:.0}%"),
-            [("TEMP", cpu_temp_str), ("WATT", cpu_watt_str)],
-        ),
-        (
-            "GPU",
-            gpu_str,
-            [("TEMP", gpu_temp_str), ("WATT", gpu_watt_str)],
-        ),
-        (
-            "MEM",
-            format!("{mem_pct:.0}%"),
-            [("USED", format!("{used_gb}G")), ("TOTAL", format!("{total_gb}G"))],
-        ),
-    ];
-
-    if is_portrait(rotation) {
-        // ── Portrait: 4 panel bertumpuk + AI di bawah ──
-        let margin = 8u32;
-        let gap = 8u32;
-        let usable_w = width.saturating_sub(margin * 2);
-        let ai_h = (area_height.saturating_sub(gap * 5)) * 30 / 100;
-        let panel_h = area_height.saturating_sub(gap * 5).saturating_sub(ai_h) / 4;
-
-        for (i, (label, big, cells)) in metric_panels.iter().enumerate() {
-            let y = area_top + i as u32 * (panel_h + gap);
-            draw_metric_panel(fb, margin, y, usable_w, panel_h, label, big, cells, p, value_scale, detail_scale);
-        }
-        let net_y = area_top + 4 * (panel_h + gap);
-        draw_net_panel(
-            fb,
-            margin,
-            net_y,
-            usable_w,
-            panel_h,
-            ("DL", dl_val, dl_unit),
-            ("UP", up_val, up_unit),
-            p,
-            value_scale,
-            detail_scale,
-        );
-        let ai_y = net_y + panel_h + gap;
-        draw_ai_panel(fb, margin, ai_y, usable_w, ai_h, ai, marquee, p, value_scale, detail_scale);
-    } else {
-        // ── Landscape: baris atas 4 panel, baris bawah AI selebar layar ──
-        let side_margin = 16u32;
-        let gap = 10u32;
-        let usable_w = width.saturating_sub(side_margin * 2);
-        let cols = 4u32;
-        let panel_w = (usable_w.saturating_sub(gap * (cols - 1))) / cols;
-        // Baris atas 1/3 tinggi layar, baris bawah (AI) 2/3.
-        let top_row_h = (area_height.saturating_sub(gap)) / 3;
-        let ai_row_h = area_height.saturating_sub(gap).saturating_sub(top_row_h);
-
-        for (col, (label, big, cells)) in metric_panels.iter().enumerate() {
-            let x = side_margin + col as u32 * (panel_w + gap);
-            draw_metric_panel(fb, x, area_top, panel_w, top_row_h, label, big, cells, p, value_scale, detail_scale);
-        }
-        draw_net_panel(
-            fb,
-            side_margin + 3 * (panel_w + gap),
-            area_top,
-            panel_w,
-            top_row_h,
-            ("DL", dl_val, dl_unit),
-            ("UP", up_val, up_unit),
-            p,
-            value_scale,
-            detail_scale,
-        );
-
-        let ai_y = area_top + top_row_h + gap;
-        draw_ai_panel(fb, side_margin, ai_y, usable_w, ai_row_h, ai, marquee, p, value_scale, detail_scale);
-    }
-}
-
-
 /// Warna bar berdasarkan level (0.0-1.0) & `color_mode`:
 /// - `Default`: gradien hijau (pelan) -> kuning -> merah (keras), seperti semula.
 /// - `Custom(r, g, b)`: satu warna tetap, tapi kecerahannya tetap diskalakan
@@ -1676,17 +1211,6 @@ fn level_color(level: f32, color_mode: ColorMode) -> (u8, u8, u8) {
     }
 }
 
-/// Warna "aksen" solid dipakai buat jam idle — beda dari `level_color` yang
-/// diskalakan mengikuti level bar, jam ini selalu tampil terang penuh (bukan
-/// diredupkan) supaya jelas kebaca dari jarak jauh saat layar lagi "kosong".
-fn accent_color(color_mode: ColorMode) -> (u8, u8, u8) {
-    match color_mode {
-        // Hijau sangat gelap — setengah dari versi sebelumnya (0x0C7838).
-        ColorMode::Default => (0x06, 0x3C, 0x1C),
-        ColorMode::Custom(r, g, b) => (r, g, b),
-    }
-}
-
 /// Dashboard grid: 4 kotak (FPS, GPU, CPU, RAM) sejajar — pengganti bar EQ/jam
 /// saat `gaming_mode` aktif (GPU usage > 50%, lihat main loop). Baris info
 /// kecil (`draw_status_lines`) tetap tampil terpisah di atas seperti biasa.
@@ -1697,13 +1221,12 @@ fn accent_color(color_mode: ColorMode) -> (u8, u8, u8) {
 fn draw_game_dashboard(
     fb: &mut Framebuffer,
     sys: &System,
-    bg: Option<&background::Background>,
     gpu_percent: Option<f32>,
     gpu_data: &gpu_amd::GpuAmdData,
     cpu_temp: Option<f32>,
     cpu_power: Option<f32>,
     cpu_mhz: Option<u32>,
-    color_mode: ColorMode,
+    palette: Palette,
     rotation: Rotation,
 ) {
     let width = fb.width();
@@ -1714,16 +1237,13 @@ fn draw_game_dashboard(
     let area_top = top_margin;
     let area_height = height.saturating_sub(top_margin + bottom_margin);
 
-    let border = accent_color(color_mode);
-    // Sengaja TIDAK memakai auto-kontras (`readable`) di dalam panel: `panel_bg`
-    // di bawah ini opaque dan gelap, jadi teks terang selalu terbaca. Kalau
-    // auto-kontras dipasang di sini, ia akan mengukur luminansi *gambar
-    // background* — bukan panel — lalu bisa memilih teks hitam di atas panel
-    // gelap, persis kebalikan dari yang diinginkan.
-    let panel_bg = (0x14u8, 0x14u8, 0x1Cu8);
-    let label_color = (0xA0u8, 0xA0u8, 0xA8u8);
-    // Hijau terminal (sama dengan grid dashboard).
-    let value_color = (0x00u8, 0xE0u8, 0x64u8);
+    let Palette {
+        border,
+        panel_bg,
+        label_color,
+        value_color,
+        ..
+    } = palette;
     let border_thickness = 2u32;
 
     struct Panel {
@@ -1921,7 +1441,7 @@ fn fit_text_scale(text: &str, max_width: u32, max_scale: u32) -> u32 {
 /// tetap digambar terpisah seperti biasa, tidak terpengaruh fungsi ini.
 fn draw_idle_clock(
     fb: &mut Framebuffer,
-    color_mode: ColorMode,
+    accent: (u8, u8, u8),
     rotation: Rotation,
     date_marquee: &mut Marquee,
     bg: Option<&background::Background>,
@@ -1929,7 +1449,7 @@ fn draw_idle_clock(
     let width = fb.width();
     let height = fb.height();
 
-    let (r, g, b) = accent_color(color_mode);
+    let (r, g, b) = accent;
     let now = Local::now();
 
     if is_portrait(rotation) {
@@ -2266,62 +1786,154 @@ fn format_uptime(total_secs: u64) -> String {
 }
 
 #[cfg(test)]
-mod grid_preview {
+mod dashboard_tests {
     use super::*;
 
     #[test]
+    fn file_preferences_and_cli_precedence() {
+        let defaults = parse_args_from(
+            ["--config", "examples/grid.json"]
+                .map(str::to_owned)
+                .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(defaults.profile, Profile::Grid);
+        assert_eq!(defaults.theme, Theme::Standard);
+        assert_eq!((defaults.idle_fps, defaults.active_fps), (2.0, 15.0));
+        assert!(!defaults.no_audio && defaults.inferrig_url.is_none());
+
+        let args = [
+            "--audio",
+            "--idle-fps",
+            "7",
+            "--theme",
+            "standard",
+            "--config",
+            "examples/inference.json",
+        ];
+        let c = parse_args_from(args.map(str::to_owned).into_iter()).unwrap();
+        assert_eq!(c.profile, Profile::Inference);
+        assert_eq!(c.theme, Theme::Standard);
+        assert_eq!(c.idle_fps, 7.0);
+        assert!(!c.no_audio);
+        assert!(c.inferrig_url.is_some());
+        for flag in ["--classic", "--no-inferrig"] {
+            let args = ["--config", "examples/inference.json", flag];
+            assert!(parse_args_from(args.map(str::to_owned).into_iter())
+                .unwrap()
+                .inferrig_url
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn inference_panels_fill_the_canvas_with_and_without_ai() {
+        for (w, h) in [(1280, 480), (1920, 462), (640, 172), (960, 320), (360, 360)] {
+            for (w, h, portrait) in [(w, h, false), (h, w, true)] {
+                for enabled in [false, true] {
+                    let (system, ai) = dashboard::inference_layout(w, h, portrait, enabled);
+                    let rects: Vec<_> = system.into_iter().chain(ai).collect();
+                    assert_eq!(rects.len(), 4 + usize::from(enabled));
+                    for (i, r) in rects.iter().enumerate() {
+                        assert!(r.w > 0 && r.h > 0 && r.x + r.w <= w && r.y + r.h <= h);
+                        for q in &rects[..i] {
+                            assert!(
+                                q.x + q.w <= r.x
+                                    || r.x + r.w <= q.x
+                                    || q.y + q.h <= r.y
+                                    || r.y + r.h <= q.y
+                            );
+                        }
+                    }
+                    assert_eq!(rects.last().unwrap().y + rects.last().unwrap().h, h - 10);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn render_previews() {
-        let gpu_data = gpu_amd::GpuAmdData::default();
-        let mut marquee = Marquee::new();
-        let sys = System::new();
-
-        let ai = inferrig::InferrigState {
-            state: "ready".to_string(),
-            model: "unsloth-ud-iq4-xs-qwen3-8-flash-next".to_string(),
-            profile: "qwen38-flash-next".to_string(),
-            gen_tps: 42.7,
-            prompt_tps: 1289.4,
-            requests_active: 2,
-            requests_queued: 1,
-            context_peak: 9000,
-            context_configured: 87552,
-            gpu_mem_used_bytes: 68.7 * 1024.0 * 1024.0 * 1024.0,
-            gpu_mem_budget_bytes: 114.0 * 1024.0 * 1024.0 * 1024.0,
-            updated: Some(std::time::Instant::now()),
-            error: None,
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let gpu = gpu_amd::GpuAmdData {
+            temp_edge_c: Some(51),
+            power_w: Some(82),
+            ..Default::default()
         };
-
-        let mut fb = Framebuffer::new(Resolution::new(1280, 480));
-        draw_grid_layout(
-            &mut fb, &sys,
-            Some(42.0), &gpu_data,
-            (1024.0, 256.0),
-            Some(55.0), Some(65.0),
-            &ai, &mut marquee,
-            ColorMode::Default, Rotation::Deg0,
-        );
-        std::fs::write("target/preview_1280x480.png", png_save::encode(&fb)).unwrap();
-
-        let mut fb2 = Framebuffer::new(Resolution::new(480, 1280));
-        draw_grid_layout(
-            &mut fb2, &sys,
-            Some(42.0), &gpu_data,
-            (1024.0, 256.0),
-            Some(55.0), Some(65.0),
-            &ai, &mut marquee,
-            ColorMode::Default, Rotation::Deg90,
-        );
-        std::fs::write("target/preview_portrait.png", png_save::encode(&fb2)).unwrap();
-
-        let mut fb3 = Framebuffer::new(Resolution::new(1920, 462));
-        draw_grid_layout(
-            &mut fb3, &sys,
-            Some(42.0), &gpu_data,
-            (1024.0, 256.0),
-            Some(55.0), Some(65.0),
-            &ai, &mut marquee,
-            ColorMode::Default, Rotation::Deg0,
-        );
-        std::fs::write("target/preview_1920x462.png", png_save::encode(&fb3)).unwrap();
+        let readings = Readings {
+            sys: &sys,
+            gpu: &gpu,
+            gpu_percent: Some(42.0),
+            cpu_temp: Some(55.0),
+            cpu_power: Some(65.0),
+            cpu_mhz: Some(4200),
+            net: (1024.0, 256.0),
+            disk: (8.0, 1.2),
+            volume: Some((70.0, false)),
+        };
+        let ai = inferrig::InferrigState {
+            lifecycle: Some(inferrig::Lifecycle {
+                state: "ready".into(),
+                active_model: Some("Qwen3-8B".into()),
+            }),
+            telemetry: serde_json::from_str(
+                r#"{"generation_tokens_per_second":42.7,
+                "prompt_tokens_per_second":1289.4,"requests_active":2,"requests_queued":1,
+                "host":{"gpu_memory":{"kind":"gtt","used_bytes":8589934592}}}"#,
+            )
+            .unwrap(),
+        };
+        let dir = std::path::Path::new("target/dashboard-previews");
+        std::fs::create_dir_all(dir).unwrap();
+        for (w, h) in [(1280, 480), (1920, 462), (640, 172), (360, 360)] {
+            for (w, h, rotation, orientation) in [
+                (w, h, Rotation::Deg0, "landscape"),
+                (h, w, Rotation::Deg90, "portrait"),
+            ] {
+                for (profile, theme) in [("grid", Theme::Standard), ("inference", Theme::Terminal)]
+                {
+                    let color = ColorMode::Default;
+                    let palette = Palette::new(theme, color);
+                    let mut fb = Framebuffer::new(Resolution::new(w, h));
+                    let mut marquee = Marquee::new();
+                    if profile == "grid" {
+                        let bars = std::array::from_fn::<_, NUM_BARS, _>(|i| {
+                            (i as f32 * 0.21).sin().abs()
+                        });
+                        grid::draw(
+                            &mut fb,
+                            &readings,
+                            Some("Now playing"),
+                            &mut marquee,
+                            color,
+                            palette,
+                            rotation,
+                            &bars,
+                        );
+                    } else {
+                        draw_inference(
+                            &mut fb,
+                            &readings,
+                            true,
+                            Some(&ai),
+                            &mut marquee,
+                            palette,
+                            rotation,
+                        );
+                    }
+                    assert!(fb.as_bytes().chunks_exact(3).any(|px| px
+                        == [
+                            palette.value_color.0,
+                            palette.value_color.1,
+                            palette.value_color.2
+                        ]));
+                    std::fs::write(
+                        dir.join(format!("{profile}-{orientation}-{w}x{h}.png")),
+                        png_save::encode(&fb),
+                    )
+                    .unwrap();
+                }
+            }
+        }
     }
 }

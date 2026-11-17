@@ -1,14 +1,14 @@
-//! Program Second Monitor untuk Thermalright Trofeo Vision 9.16 LCD.
+//! Program Second Monitor untuk Thermalright Trofeo Vision LCD.
 //!
 //! Menangkap tampilan dari layar desktop Windows atau monitor virtual (misal
 //! Virtual Display Driver) secara real-time via DXGI Desktop Duplication API,
-//! lalu mengirimkannya ke layar Trofeo LCD via USB bulk transfer (protokol LY).
+//! lalu mengirimkannya ke layar Trofeo LCD via USB HID atau LY.
 
 use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use trofeo_lcd::dxgi_capture::{self, CaptureResult, DxgiSession};
 use trofeo_lcd::png_save;
-use trofeo_lcd::{hotkey, Framebuffer, LyLcd, Rotation, TROFEO_VISION_9_16};
+use trofeo_lcd::{hotkey, Framebuffer, Resolution, Rotation, Screen};
 
 const DEFAULT_ACTIVE_FPS: f32 = 30.0;
 const DEFAULT_IDLE_FPS: f32 = 10.0;
@@ -31,18 +31,18 @@ struct Config {
 
 fn print_help() {
     println!(
-        "trofeo_screen — Second Monitor Streamer untuk Thermalright Trofeo Vision 9.16 LCD\n\n\
+        "trofeo_screen — Second Monitor Streamer untuk Thermalright Trofeo Vision LCD\n\n\
         PENGGUNAAN:\n\
         \x20 trofeo_screen [OPSI]\n\n\
         OPSI:\n\
         \x20 -l, --list-displays       Tampilkan daftar seluruh monitor terdeteksi lalu keluar\n\
         \x20 -d, --display <INDEX>     Index monitor yang akan di-stream ke LCD\n\
-        \x20                           (default: otomatis pilih monitor beresolusi 1920x462,\n\
+        \x20                           (default: otomatis pilih monitor sesuai resolusi LCD,\n\
         \x20                            atau monitor sekunder)\n\
         \x20     --fps <N>             Target FPS saat layar ada perubahan (default: {DEFAULT_ACTIVE_FPS})\n\
         \x20     --idle-fps <N>        Target polling FPS saat layar diam (default: {DEFAULT_IDLE_FPS})\n\
         \x20 -q, --quality <1-100>     Kualitas kompresi JPEG (default: {DEFAULT_JPEG_QUALITY})\n\
-        \x20 -r, --rotate              Putar tampilan 180 derajat (jika layar terbalik)\n\
+        \x20 -r, --rotate [DEG]        Putar layar 0/90/180/270 (tanpa nilai: 180)\n\
         \x20     --hide-console        Sembunyikan jendela konsol di Windows (cocok untuk autorun)\n\
         \x20 -k, --screenshot-key <KEY>  Global hotkey untuk menyimpan tangkapan layar\n\
         \x20                           frame LCD sebagai PNG ke Desktop (f1-f12,\n\
@@ -52,7 +52,7 @@ fn print_help() {
 }
 
 fn parse_args() -> Result<Config> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     let mut display_index = None;
     let mut active_fps = DEFAULT_ACTIVE_FPS;
     let mut idle_fps = DEFAULT_IDLE_FPS;
@@ -96,10 +96,12 @@ fn parse_args() -> Result<Config> {
                     .map_err(|_| anyhow::anyhow!("--quality: '{raw}' bukan angka 1-100 valid"))?
                     .clamp(1, 100);
             }
-            "--rotate" => {
-                let raw = args.next().ok_or_else(|| anyhow::anyhow!("--rotate butuh nilai derajat (0, 90, 180, 270)"))?;
-                let deg: u32 = raw.parse()
-                    .map_err(|_| anyhow::anyhow!("--rotate: '{raw}' bukan angka valid"))?;
+            "-r" | "--rotate" => {
+                let deg = if args.peek().is_some_and(|arg| !arg.starts_with('-')) {
+                    args.next().unwrap().parse::<u32>()?
+                } else {
+                    180
+                };
                 rotation = match deg {
                     0 => Rotation::Deg0,
                     90 => Rotation::Deg90,
@@ -156,7 +158,11 @@ fn show_displays() -> Result<()> {
     for d in &displays {
         let res = format!("{}x{}", d.width, d.height);
         let status = if d.is_attached { "Aktif" } else { "Nonaktif" };
-        let marker = if d.width == 1920 && d.height == 462 { " [MATCH 1920x462]" } else { "" };
+        let marker = if matches!((d.width, d.height), (1920, 462) | (1280, 480)) {
+            " [LCD]"
+        } else {
+            ""
+        };
         println!(
             "{:<6} {:<24} {:<16} {:<12} {:<10}{}",
             d.index,
@@ -184,22 +190,12 @@ fn main() -> Result<()> {
     }
 
     println!("============================================================");
-    println!("  Trofeo Vision 9.16 — Second Monitor Streamer");
+    println!("  Trofeo Vision — Second Monitor Streamer");
     println!("============================================================");
 
-    // Buka koneksi USB ke layar Trofeo LCD
-    println!("Mencari perangkat Thermalright Trofeo Vision LCD (0416:5408)...");
-    let lcd = match LyLcd::open() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("GAGAL: Tidak dapat membuka koneksi USB ke Trofeo LCD: {e}");
-            eprintln!("Pastikan kabel USB terpasang dan driver WinUSB sudah dipasang (via Zadig).");
-            bail!(e);
-        }
-    };
-
-    let hs = lcd.handshake()?;
-    println!("LCD Terhubung: {:?}, PM={} SUB={}", lcd.variant(), hs.pm, hs.sub);
+    let lcd = Screen::open(None)?;
+    let resolution = lcd.resolution();
+    println!("LCD: {}x{}", resolution.width, resolution.height);
 
     // Hotkey tangkapan layar (global, default NONAKTIF — aktif hanya kalau
     // argumen --screenshot-key diberikan).
@@ -218,7 +214,12 @@ fn main() -> Result<()> {
     }
 
     // Inisialisasi sesi penangkap layar DXGI
-    let mut session = match DxgiSession::new(config.display_index) {
+    let capture_size = if matches!(config.rotation, Rotation::Deg90 | Rotation::Deg270) {
+        Resolution::new(resolution.height, resolution.width)
+    } else {
+        resolution
+    };
+    let mut session = match DxgiSession::for_resolution(config.display_index, capture_size) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("\nGAGAL menginisialisasi capture monitor: {e}");
@@ -230,7 +231,8 @@ fn main() -> Result<()> {
     let (src_w, src_h) = session.src_resolution();
     let display_idx = session.display_index();
     println!(
-        "Menangkap Display [{display_idx}] (Resolusi: {src_w}x{src_h}) -> Stream ke LCD (1920x462)"
+        "Menangkap Display [{display_idx}] (Resolusi: {src_w}x{src_h}) -> LCD {}x{}",
+        resolution.width, resolution.height
     );
     println!(
         "Pengaturan: Active FPS: {:.1} | Idle FPS: {:.1} | Quality: {}%",
@@ -238,13 +240,14 @@ fn main() -> Result<()> {
     );
     println!("Streaming dimulai... Tekan Ctrl+C untuk berhenti.\n");
 
-    let resolution = TROFEO_VISION_9_16;
-    let mut fb = Framebuffer::new(resolution);
+    let mut fb = Framebuffer::new(capture_size);
+    let mut rotated = None;
 
     let active_frame_time = Duration::from_secs_f32(1.0 / config.active_fps);
     let idle_frame_time = Duration::from_secs_f32(1.0 / config.idle_fps);
     let mut last_snap = Instant::now() - SNAP_MIN_INTERVAL;
 
+    let mut has_frame = false;
     loop {
         let frame_start = Instant::now();
 
@@ -263,39 +266,42 @@ fn main() -> Result<()> {
         // Tangkap frame berikutnya dari DXGI (timeout 100ms)
         let capture_result = session.acquire_next_frame(100, &mut fb);
 
-        match capture_result {
+        let (send, interval) = match capture_result {
             Ok(CaptureResult::NewFrame) => {
-                // Layar berubah: kirim frame baru ke LCD
-                if let Err(e) = lcd.send_framebuffer(&fb, config.quality, Rotation::Deg0) {
-                    eprintln!("Peringatan USB: Gagal mengirim frame ke LCD ({e}), mencoba kembali...");
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-
-                // Jaga target active FPS
-                let elapsed = frame_start.elapsed();
-                if elapsed < active_frame_time {
-                    std::thread::sleep(active_frame_time - elapsed);
-                }
+                has_frame = true;
+                rotated = match config.rotation {
+                    Rotation::Deg90 => Some(fb.rotated_270()),
+                    Rotation::Deg270 => Some(fb.rotated_90()),
+                    _ => None,
+                };
+                (true, active_frame_time)
             }
             Ok(CaptureResult::Timeout) => {
-                // Layar statis/diam: tidak perlu kirim apa-apa (hemat USB & CPU!)
-                let elapsed = frame_start.elapsed();
-                if elapsed < idle_frame_time {
-                    std::thread::sleep(idle_frame_time - elapsed);
-                }
+                (has_frame && matches!(&lcd, Screen::Hid(_)), idle_frame_time)
             }
             Ok(CaptureResult::NeedsReinit) => {
                 eprintln!("Mode monitor berubah atau akses terputus. Menginisialisasi ulang capture...");
                 std::thread::sleep(Duration::from_millis(500));
-                if let Ok(new_sess) = DxgiSession::new(Some(display_idx)) {
+                if let Ok(new_sess) = DxgiSession::for_resolution(Some(display_idx), capture_size) {
                     session = new_sess;
+                    has_frame = false;
                     println!("Capture berhasil diinisialisasi ulang.");
                 }
+                continue;
             }
             Err(e) => {
                 eprintln!("Peringatan Capture: {e}");
                 std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        if send {
+            let image = rotated.as_ref().unwrap_or(&fb);
+            if let Err(e) = lcd.send_framebuffer(image, config.quality, config.rotation) {
+                eprintln!("LCD frame transfer failed: {e}");
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
+        std::thread::sleep(interval.saturating_sub(frame_start.elapsed()));
     }
 }

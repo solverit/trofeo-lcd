@@ -1,8 +1,8 @@
-# Guide: Using the Trofeo Vision 9.16 as a Second Monitor
+# Guide: Using the Trofeo LCD as a Second Monitor
 
 **English** · [Bahasa Indonesia](./GUIDE_SECOND_MONITOR.id.md)
 
-This guide explains how to turn the **Thermalright Trofeo Vision 9.16 LCD**
+This guide explains how to turn the **Thermalright Trofeo LCD**
 into a **real second monitor on Windows**, so you can drag app windows (like
 Spotify, Discord, a browser, or Task Manager) directly onto the Trofeo
 screen.
@@ -15,7 +15,7 @@ The Trofeo screen connects to the PC only through a USB cable (no HDMI /
 DisplayPort). Therefore:
 
 1. We create a **Virtual Monitor** in Windows at the native resolution
-   **1920×462**.
+   **1280×480** for the 6-inch LCD (1920×462 for the 9.16-inch model).
 2. The **`trofeo_screen`** program captures that virtual monitor in real
    time via the GPU (DXGI Desktop Duplication API) and sends it to the Trofeo
    screen over USB.
@@ -31,8 +31,8 @@ DisplayPort). Therefore:
 4. Add the special Trofeo Vision resolution:
    ```xml
    <resolution>
-     <width>1920</width>
-     <height>462</height>
+     <width>1280</width>
+     <height>480</height>
      <refresh_rate>60</refresh_rate>
    </resolution>
    ```
@@ -40,7 +40,7 @@ DisplayPort). Therefore:
    Administrator.
 6. Open **Windows Settings → System → Display**:
    - A new monitor (**Display 2**) should appear.
-   - Set its resolution to **1920 × 462**.
+   - Set its resolution to **1280 × 480**.
    - Position the second monitor above, below, or beside your main monitor
      as you wish.
 
@@ -62,11 +62,11 @@ Detected Monitors:
 INDEX  ADAPTER                  DEVICE           RESOLUTION  STATUS
 ---------------------------------------------------------------------------
 0      AMD Radeon RX 6600       \\.\DISPLAY1     1920x1080    Active
-1      IddCx Virtual Display    \\.\DISPLAY2     1920x462     Active [MATCH 1920x462]
+1      IddCx Virtual Display    \\.\DISPLAY2     1280x480     Active [LCD]
 ---------------------------------------------------------------------------
 ```
 
-*The program automatically detects the display at 1920×462!*
+*The program automatically detects the display at 1280×480!*
 
 ### Start streaming to the Trofeo screen
 
@@ -82,7 +82,7 @@ Or just run the compiled binary:
 
 The program will automatically:
 
-1. Connect to the Trofeo screen over USB bulk (`0416:5408`).
+1. Connect to the Trofeo screen over USB HID (`0416:5302`) / LY (`0416:5408`, `0416:5409`).
 2. Capture the virtual monitor in real time.
 3. Stream window movement and the mouse cursor to the Trofeo screen.
 
@@ -93,7 +93,7 @@ The program will automatically:
 | Option | Purpose | Default |
 |---|---|---|
 | `-l`, `--list-displays` | List detected monitors and exit | - |
-| `-d`, `--display <N>` | Pick a monitor index manually when there are several | Auto (1920x462) |
+| `-d`, `--display <N>` | Pick a monitor index manually when there are several | Auto (LCD resolution) |
 | `--fps <N>` | Maximum target frame rate while the screen moves | `30` |
 | `--idle-fps <N>` | Polling speed while the screen is static (saves CPU) | `10` |
 | `-q`, `--quality <1-100>` | JPEG image compression quality | `75` |

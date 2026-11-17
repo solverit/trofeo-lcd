@@ -53,6 +53,7 @@ mod imp {
         // terbesar (asumsi: itu adapter fisik yang benar-benar dipakai),
         // bukan total semua interface.
         net_prev: HashMap<u32, (u64, u64)>,
+        include_disk: bool,
         prev_disk_read: u64,
         prev_disk_write: u64,
         prev_time: Instant,
@@ -60,9 +61,10 @@ mod imp {
     }
 
     impl NetDiskMonitor {
-        pub fn new() -> Self {
+        pub fn new(include_disk: bool) -> Self {
             Self {
                 net_prev: HashMap::new(),
+                include_disk,
                 prev_disk_read: 0,
                 prev_disk_write: 0,
                 prev_time: Instant::now(),
@@ -73,7 +75,11 @@ mod imp {
         /// Kembalikan `(net_down_kb_s, net_up_kb_s, disk_read_mb_s, disk_write_mb_s)`.
         pub fn sample(&mut self) -> (f64, f64, f64, f64) {
             let net_rows = read_network_rows();
-            let (disk_read, disk_write) = read_disk_totals();
+            let (disk_read, disk_write) = if self.include_disk {
+                read_disk_totals()
+            } else {
+                (0, 0)
+            };
 
             let now = Instant::now();
             let elapsed = now.duration_since(self.prev_time).as_secs_f64().max(0.001);
@@ -238,6 +244,7 @@ mod imp {
         // (bukan jumlah semua interface) tiap sample — lihat komentar
         // panjang di versi Windows soal alasannya.
         net_prev: HashMap<String, (u64, u64)>,
+        include_disk: bool,
         prev_disk_read: u64,
         prev_disk_write: u64,
         prev_time: Instant,
@@ -245,9 +252,10 @@ mod imp {
     }
 
     impl NetDiskMonitor {
-        pub fn new() -> Self {
+        pub fn new(include_disk: bool) -> Self {
             Self {
                 net_prev: HashMap::new(),
+                include_disk,
                 prev_disk_read: 0,
                 prev_disk_write: 0,
                 prev_time: Instant::now(),
@@ -258,7 +266,11 @@ mod imp {
         /// Kembalikan `(net_down_kb_s, net_up_kb_s, disk_read_mb_s, disk_write_mb_s)`.
         pub fn sample(&mut self) -> (f64, f64, f64, f64) {
             let net_rows = read_network_rows();
-            let (disk_read, disk_write) = read_disk_totals();
+            let (disk_read, disk_write) = if self.include_disk {
+                read_disk_totals()
+            } else {
+                (0, 0)
+            };
 
             let now = Instant::now();
             let elapsed = now.duration_since(self.prev_time).as_secs_f64().max(0.001);
@@ -437,7 +449,7 @@ mod imp {
     }
 
     impl NetDiskMonitor {
-        pub fn new() -> Self {
+        pub fn new(include_disk: bool) -> Self {
             let rate: Arc<Mutex<Rate>> = Arc::new(Mutex::new(Rate::default()));
             let bg = Arc::clone(&rate);
             // Kalau thread gagal spawn, `rate` tetap default (0.0) — program
@@ -445,7 +457,7 @@ mod imp {
             // ditemukan. Tidak layak menghentikan program hanya karena ini.
             let _ = std::thread::Builder::new()
                 .name("netdisk-macos".into())
-                .spawn(move || run(bg));
+                .spawn(move || run(bg, include_disk));
             Self { rate }
         }
 
@@ -459,7 +471,7 @@ mod imp {
     /// Loop thread background: baca counter mentah, simpan turunan ke
     /// `shared`, ulangi. `elapsed` dihitung dari `Instant` lokal (bukan
     /// counter kernel) supaya tidak perlu takut clock melompat.
-    fn run(shared: Arc<Mutex<Rate>>) {
+    fn run(shared: Arc<Mutex<Rate>>, include_disk: bool) {
         let mut net_prev: HashMap<String, (u64, u64)> = HashMap::new();
         let mut disk_prev: (u64, u64) = (0, 0);
         let mut prev_time = Instant::now();
@@ -469,7 +481,11 @@ mod imp {
             std::thread::sleep(REFRESH_INTERVAL);
 
             let rows = read_network_rows();
-            let disk = read_disk_totals();
+            let disk = if include_disk {
+                read_disk_totals()
+            } else {
+                (0, 0)
+            };
 
             let now = Instant::now();
             let elapsed = now.duration_since(prev_time).as_secs_f64().max(0.001);
@@ -734,7 +750,7 @@ mod imp {
         #[test]
         #[ignore]
         fn reports_live_traffic() {
-            let mut mon = NetDiskMonitor::new();
+            let mut mon = NetDiskMonitor::new(true);
             // Tunggu thread background menyelesaikan satu putaran + meng-prime
             // delta (butuh 2 putaran ~2 detik sebelum angka muncul).
             std::thread::sleep(REFRESH_INTERVAL * 2);
@@ -776,7 +792,7 @@ mod imp {
     pub struct NetDiskMonitor;
 
     impl NetDiskMonitor {
-        pub fn new() -> Self {
+        pub fn new(_include_disk: bool) -> Self {
             Self
         }
 

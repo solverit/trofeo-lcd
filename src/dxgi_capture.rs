@@ -103,6 +103,13 @@ pub mod windows_dxgi {
         /// monitor yang beresolusi 1920x462. Jika tidak ada, memilih monitor ke-1 (sekunder)
         /// atau ke-0 (utama).
         pub fn new(display_index: Option<usize>) -> Result<Self> {
+            Self::for_resolution(display_index, crate::TROFEO_VISION_9_16)
+        }
+
+        pub fn for_resolution(
+            display_index: Option<usize>,
+            resolution: crate::Resolution,
+        ) -> Result<Self> {
             let displays = list_displays()?;
             if displays.is_empty() {
                 bail!("Tidak ada monitor yang terdeteksi di sistem!");
@@ -116,8 +123,11 @@ pub mod windows_dxgi {
                     idx
                 }
                 None => {
-                    // Cari display dengan resolusi 1920x462 (Trofeo Vision native)
-                    if let Some(pos) = displays.iter().position(|d| d.width == 1920 && d.height == 462) {
+                    // Prefer the native dimensions of the connected panel.
+                    if let Some(pos) = displays
+                        .iter()
+                        .position(|d| d.width == resolution.width && d.height == resolution.height)
+                    {
                         pos
                     } else if displays.len() > 1 {
                         1 // fallback ke second monitor
@@ -370,6 +380,13 @@ pub mod dummy {
 
     impl DxgiSession {
         pub fn new(_display_index: Option<usize>) -> Result<Self> {
+            Self::for_resolution(_display_index, crate::TROFEO_VISION_9_16)
+        }
+
+        pub fn for_resolution(
+            _display_index: Option<usize>,
+            _resolution: crate::Resolution,
+        ) -> Result<Self> {
             bail!("DXGI Desktop Duplication hanya tersedia di sistem operasi Windows.")
         }
 

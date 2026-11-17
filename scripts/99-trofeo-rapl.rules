@@ -1,0 +1,2 @@
+# Optional, installed by root-setup.sh --rapl.
+ACTION=="add|change", SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", ATTR{name}=="package-*", TEST=="energy_uj", RUN+="/usr/bin/chgrp trofeo-rapl /sys%p/energy_uj", RUN+="/usr/bin/chmod 0440 /sys%p/energy_uj"

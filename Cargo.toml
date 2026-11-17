@@ -2,7 +2,7 @@
 name = "trofeo_lcd"
 version = "0.1.0"
 edition = "2021"
-description = "Program sederhana untuk mengirim framebuffer ke Thermalright Trofeo Vision 9.16 LCD (protokol LY, USB 0416:5408), berdasarkan reverse-engineering dari thermalright-trcc-linux"
+description = "System dashboard and second-monitor streamer for Thermalright HID and LY LCDs"
 license = "GPL-3.0-or-later"
 
 [dependencies]
@@ -30,6 +30,7 @@ serde_json = "1"
 sysinfo = { version = "0.30", default-features = false }
 thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "net", "time"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [target."cfg(windows)".dependencies]
 wasapi = "0.24.0"

@@ -1,9 +1,8 @@
-# Panduan: Menggunakan Trofeo Vision 9.16 Sebagai Second Monitor
+# Panduan: Menggunakan Trofeo LCD Sebagai Second Monitor
 
 **Bahasa Indonesia** · [English](./GUIDE_SECOND_MONITOR.md)
 
-Panduan ini menjelaskan cara mengubah layar **Thermalright Trofeo Vision 9.16
-LCD** menjadi **monitor sekunder asli di Windows**, sehingga Anda bisa
+Panduan ini menjelaskan cara mengubah layar **Thermalright Trofeo LCD** menjadi **monitor sekunder asli di Windows**, sehingga Anda bisa
 menggeser jendela aplikasi (seperti Spotify, Discord, browser, atau task
 manager) langsung ke layar Trofeo.
 
@@ -15,7 +14,7 @@ Layar Trofeo terhubung ke PC hanya melalui kabel USB (bukan HDMI /
 DisplayPort). Oleh karena itu:
 
 1. Kita membuat sebuah **Monitor Virtual** di Windows dengan resolusi native
-   **1920×462**.
+   **1280×480** untuk layar 6 inci (1920×462 untuk layar 9,16 inci).
 2. Program **`trofeo_screen`** menangkap tampilan monitor virtual tersebut
    secara real-time via GPU (DXGI Desktop Duplication API) dan mengirimkannya
    ke layar Trofeo melalui USB.
@@ -32,8 +31,8 @@ DisplayPort). Oleh karena itu:
 4. Tambahkan resolusi khusus Trofeo Vision:
    ```xml
    <resolution>
-     <width>1920</width>
-     <height>462</height>
+     <width>1280</width>
+     <height>480</height>
      <refresh_rate>60</refresh_rate>
    </resolution>
    ```
@@ -41,7 +40,7 @@ DisplayPort). Oleh karena itu:
    sebagai Administrator).
 6. Buka **Windows Settings → System → Display**:
    - Anda akan melihat monitor baru muncul (**Display 2**).
-   - Atur resolusinya ke **1920 × 462**.
+   - Atur resolusinya ke **1280 × 480**.
    - Posisikan monitor kedua di atas, bawah, atau samping monitor utama
      sesuai keinginan.
 
@@ -63,11 +62,11 @@ Daftar Monitor Terdeteksi:
 INDEX  ADAPTER                  DEVICE           RESOLUSI     STATUS
 ---------------------------------------------------------------------------
 0      AMD Radeon RX 6600       \\.\DISPLAY1     1920x1080    Aktif
-1      IddCx Virtual Display    \\.\DISPLAY2     1920x462     Aktif [MATCH 1920x462]
+1      IddCx Virtual Display    \\.\DISPLAY2     1280x480     Aktif [LCD]
 ---------------------------------------------------------------------------
 ```
 
-*Program otomatis mendeteksi display yang beresolusi 1920×462!*
+*Program otomatis mendeteksi display yang beresolusi 1280×480!*
 
 ### Mulai Streaming ke Layar Trofeo
 
@@ -83,7 +82,7 @@ Atau langsung jalankan binary yang sudah di-compile:
 
 Program akan otomatis:
 
-1. Terhubung ke layar Trofeo via USB bulk (`0416:5408`).
+1. Terhubung ke layar Trofeo via USB HID (`0416:5302`) / LY (`0416:5408`, `0416:5409`).
 2. Menangkap tampilan monitor virtual secara real-time.
 3. Mengirimkan pergerakan jendela dan kursor mouse ke layar Trofeo.
 
@@ -94,7 +93,7 @@ Program akan otomatis:
 | Opsi | Fungsi | Default |
 |---|---|---|
 | `-l`, `--list-displays` | Tampilkan daftar monitor terdeteksi lalu keluar | - |
-| `-d`, `--display <N>` | Tentukan index monitor secara manual jika ada beberapa | Auto (1920x462) |
+| `-d`, `--display <N>` | Tentukan index monitor secara manual jika ada beberapa | Auto (resolusi LCD) |
 | `--fps <N>` | Target frame rate maksimum saat layar bergerak | `30` |
 | `--idle-fps <N>` | Kecepatan polling saat layar diam/statis (menghemat CPU) | `10` |
 | `-q`, `--quality <1-100>` | Kualitas kompresi gambar JPEG | `75` |

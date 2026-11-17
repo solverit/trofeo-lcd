@@ -46,6 +46,8 @@ use thiserror::Error;
 mod font;
 pub mod dxgi_capture;
 pub mod hid_lcd;
+mod screen;
+pub use screen::Screen;
 pub mod hotkey;
 /// Decoder JPEG untuk `--background` (baseline + progressive).
 pub mod jpeg_decode;
@@ -79,7 +81,7 @@ pub const TROFEO_VISION_9_16: Resolution = Resolution::new(1920, 462);
 pub enum LcdError {
     #[error("USB error: {0}")]
     Usb(#[from] rusb::Error),
-    #[error("perangkat LY (0416:5408 / 0416:5409) tidak ditemukan")]
+    #[error("Thermalright LCD not found")]
     NotFound,
     #[error("handshake gagal, respons tidak valid: {0:02x?}")]
     BadHandshake(Vec<u8>),

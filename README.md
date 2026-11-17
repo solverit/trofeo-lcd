@@ -3,20 +3,20 @@
 **English** · [Bahasa Indonesia](./README.id.md)
 
 **A lightweight, open-source alternative to the official Thermalright TRCC
-software.** Audio visualizer + system info monitor for the
-**Thermalright Trofeo Vision 9.16 LCD** (USB `0416:5408`, "LY" protocol).
-The driver was rewritten byte-for-byte from
-[thermalright-trcc-linux](https://github.com/Lexonight1/thermalright-trcc-linux).
+software.** This project uses a **6-inch Thermalright LCD**, **1280×480**,
+with USB HID ID `0416:5302`. The earlier **9.16-inch Trofeo Vision**
+(1920×462, USB bulk LY `0416:5408` / `0416:5409`) is also supported.
+The USB protocols are based on [thermalright-trcc-linux](https://github.com/Lexonight1/thermalright-trcc-linux).
 
 The **default view is a grid dashboard** that packs everything into panels
 at a glance — CPU, GPU, RAM, network & disk activity, date/time/volume and
 a now-playing visualizer. It fills the screen in either orientation:
 
-**Landscape** (`--rotate 0` or `180`, 1920×462):
+**Landscape** (`--rotate 0` or `180`, 1280×480):
 
 ![Grid dashboard — landscape](img/new_landscape.png)
 
-**Portrait** (`--rotate 90` or `270`, 462×1920):
+**Portrait** (`--rotate 90` or `270`, 480×1280):
 
 ![Grid dashboard — portrait](img/new_portrait.png)
 
@@ -41,14 +41,9 @@ system status (CPU/GPU/RAM/temp) stays readable while playing.
 
 ## Features
 
-- **Grid dashboard** (default): panels for CPU, GPU, RAM, network/disk
-  activity, date/time/volume and an **AI INFERENCE** panel fed by
-  [InferRig](https://github.com/) (local llama.cpp control plane), in
-  landscape or portrait (`--rotate`).
-- **Two LCD revisions supported**: the bulk "LY" protocol (`0416:5408` /
-  `0416:5409`) and the newer HID "Winbond USBDISPLAY" variant
-  (`0416:5302`, e.g. firmware 4.07) — auto-detected at startup, see
-  `src/hid_lcd.rs`.
+- **Grid** shows system, media and disk activity. **Inference** adds a dedicated
+  dashboard for [InferRig](https://github.com/solverit/inferrig), the local llama.cpp control plane.
+- Both executables detect LY and supported HID JPEG panels at startup.
 - EQ bars (48) from currently playing audio (WASAPI loopback on Windows,
   PulseAudio/PipeWire on Linux, Core Audio process tap on macOS), colored
   green→yellow→red. Can be turned off entirely with `--no-audio`.
@@ -71,36 +66,86 @@ cargo build --release
 **Windows** — to read AMD CPU temp/power, install
 [PawnIO](https://github.com/namazso/PawnIO) and run as Administrator.
 
-**Linux** — needs `pkg-config` + PulseAudio headers to build, and
-`playerctl` for song titles. For USB access without `sudo`, install
-`99-trofeo-lcd.rules` (see the file's contents). The same rule also makes
-the RAPL energy counters (`/sys/class/powercap/intel-rapl:*/energy_uj`)
-world-readable — Ubuntu ships them root-only, and without read access the
-CPU wattage panel shows `N/A`. Running `scripts/root-setup.sh` with sudo
-installs everything in one go.
+**Linux** — run `sudo bash scripts/root-setup.sh` for USB permissions and
+Debian/Ubuntu build dependencies. Install `playerctl` for song titles. Add
+`--rapl` to grant the invoking user CPU package energy access through the
+`trofeo-rapl` group, then log out and back in. Unavailable power readings show `N/A`.
 
 **macOS** — no extra install needed: system audio comes from a Core Audio
 process tap (native since 14.2, no virtual driver and no permission prompt).
 Run as `root` only if you want CPU power + real-time frequency; without it
 those two fields show `N/A` and everything else works.
 
+## Profiles and configuration
+
+`trofeo_lcd` reads `$XDG_CONFIG_HOME/trofeo-lcd/config.json` (default
+`~/.config/trofeo-lcd/config.json`) on Linux/macOS or
+`%APPDATA%/trofeo-lcd/config.json` on Windows. Every field is optional.
+CLI flags override the file. Unspecified values come from the selected profile.
+
+| Profile | Theme | Audio | Idle / active FPS |
+|---|---|---|---|
+| `grid` (default) | `standard` | on | 2 / 15 |
+| `inference` | `terminal` | off | 3 / 15 |
+| `classic` | `standard` | on | 2 / 15 |
+
+[Rendered inference dashboard in landscape](img/inference_landscape.png) · [Portrait](img/inference_portrait.png)
+
+| JSON key | Accepted values | Effect |
+|---|---|---|
+| `profile` | `"grid"`, `"inference"`, `"classic"` | Select the system grid, the InferRig dashboard, or the adaptive EQ, clock and game views. |
+| `theme` | `"standard"`, `"terminal"` | Use neutral or green accents for dashboard borders and values. |
+| `idle_fps` | Number greater than 0 | Target frame rate during silence or whenever audio capture is off. |
+| `active_fps` | Number greater than 0 | Target frame rate when audio capture detects sound. |
+| `audio` | `true`, `false` | Enable or disable system audio capture. |
+| `inferrig_url` | URL string | Base address of the InferRig API used by the `inference` profile. Defaults to `http://127.0.0.1:5577`. |
+| `net_peak_half_life_secs` | Number ≥ 0, in seconds | In the `inference` profile, a network peak halves over this interval. The default is 2. Set to 0 to show current transfer rates. |
+
+Unknown keys cause a configuration error. To use all InferRig defaults, the entire file can be `{"profile": "inference"}`.
+
+Example configuration for the InferRig display:
+
+```json
+{
+  "profile": "inference",
+  "theme": "terminal",
+  "idle_fps": 3,
+  "active_fps": 15,
+  "audio": false,
+  "inferrig_url": "http://127.0.0.1:5577",
+  "net_peak_half_life_secs": 2
+}
+```
+
+Run `trofeo_lcd --config examples/inference.json` to try the example, or
+copy it to the user configuration path. The supplied systemd user unit uses
+this same configuration and the executable installed by `cargo install --locked --path .`.
+
 ## Main options
 
 | Option | Purpose | Default |
 |---|---|---|
-| `--idle-fps` / `--active-fps` | FPS when idle / has sound | `2` / `15` |
+| `--config <PATH>` | Read dashboard settings from this JSON file | user configuration path above |
+| `--profile <NAME>` | Select `grid`, `inference` or `classic` | `grid` |
+| `--theme <NAME>` | Select `standard` or `terminal` | profile default |
+| `--idle-fps <N>` / `--active-fps <N>` | Target FPS during silence / sound | profile default |
+| `--silence-threshold <N>` | Peak audio amplitude below which the input counts as silent | `0.005` |
+| `--silence-timeout-ms <N>` | Continuous silence before switching to idle FPS, in milliseconds | `800` |
+| `--color <MODE>` | Override the accent with a named color, `#RRGGBB` or `R,G,B` | `default` |
+| `--openrgb-poll-ms <N>` | OpenRGB color polling interval in milliseconds | `300` |
 | `--background <PATH>` | Show a PNG/BMP/JPEG image behind the text (cropped to fit) | off |
 | `--background-dim <0-100>` | Darken that image once at load so the text stays readable — free, no per-frame cost | `15` |
 | `--rotate <DEG>` | Rotate the screen: 0, 90, 180 or 270 | `0` |
 | `--classic` | Use the classic adaptive views (EQ bars / idle clock / game dashboard) instead of the grid dashboard | grid dashboard |
-| `--no-audio` | Disable all audio/media paths (no loopback capture, no now-playing) — for a pure system-monitor setup | audio on |
+| `--audio` / `--no-audio` | Enable / disable audio capture | profile default |
 | `--inferrig-url <URL>` | Base URL of the InferRig API for the AI INFERENCE panel | `http://127.0.0.1:5577` |
-| `--no-inferrig` | Disable the AI INFERENCE panel | panel on |
+| `--no-inferrig` | Hide the AI panel and give its space to the system panels | panel enabled in `inference` |
 | `--hid-rotate <DEG>` | Override the HID panel's wire rotation (0/90/180/270) if the picture ever comes out rotated | from handshake |
 | `--no-deepcool` | Turn off DeepCool integration | enabled |
 | `--deepcool-update-ms` | DeepCool send interval (100–2000 ms) | `1000` |
 | `--openrgb-device <NAME>` | Sync color with an OpenRGB device | disabled |
 | `--hide-console` | Hide the console window (Windows) | disabled |
+| `-h, --help` | Show command-line help | — |
 | `-k, --screenshot-key` | Global hotkey to save the current LCD frame as a screenshot — **lossless PNG** (deflate-compressed, so still pixel-perfect; a flat screen ~10 KB instead of 2.6 MB raw) (f1-f12, printscreen) | off |
 
 ## Second monitor mode
@@ -113,7 +158,7 @@ don't run them together):
 ./target/release/trofeo_screen                    # stream to LCD
 ```
 
-Requires a *Virtual Display Driver* (VDD) at 1920×462 — see
+Requires a *Virtual Display Driver* (VDD) at the LCD resolution (1280×480 for the 6-inch model) — see
 **[GUIDE_SECOND_MONITOR.md](./GUIDE_SECOND_MONITOR.md)**.
 
 ## Structure

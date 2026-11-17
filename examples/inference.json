@@ -1,0 +1,9 @@
+{
+  "profile": "inference",
+  "theme": "terminal",
+  "idle_fps": 3,
+  "active_fps": 15,
+  "audio": false,
+  "inferrig_url": "http://127.0.0.1:5577",
+  "net_peak_half_life_secs": 2
+}
