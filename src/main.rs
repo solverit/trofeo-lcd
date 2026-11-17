@@ -774,6 +774,13 @@ fn main() -> anyhow::Result<()> {
 
     let mut latest_gpu_percent: Option<f32> = None;
     let mut latest_net_kb = (0.0f64, 0.0f64); // (down, up)
+    // Peak-hold kecepatan NET: naik instan ke nilai terbaru, turun pelan
+    // (decay eksponensial per refresh). Burst unduhan yang cuma berlangsung
+    // 1-3 detik (file beberapa MB pada 25+ MB/s) selesai sebelum mata sempat
+    // melirik layar yang refresh-nya 500 ms / 3 FPS — dengan peak-hold,
+    // nilai puncaknya tetap terlihat turun perlahan beberapa detik.
+    let mut net_peak_kb = (0.0f64, 0.0f64);
+    const NET_PEAK_DECAY: f64 = 0.85; // per 500 ms → ~10 detik sampai ~4%
     let mut latest_disk_mb = (0.0f64, 0.0f64); // (read, write)
     let mut latest_volume: Option<(f32, bool)> = None; // (percent, muted)
     let mut latest_cpu_temp: Option<f32> = None; // °C
@@ -859,6 +866,9 @@ fn main() -> anyhow::Result<()> {
             }
             let (down, up, read, write) = netdisk_monitor.sample();
             latest_net_kb = (down, up);
+            // Peak-hold (lihat komentar deklarasi `net_peak_kb`).
+            net_peak_kb.0 = latest_net_kb.0.max(net_peak_kb.0 * NET_PEAK_DECAY);
+            net_peak_kb.1 = latest_net_kb.1.max(net_peak_kb.1 * NET_PEAK_DECAY);
             latest_disk_mb = (read, write);
             if let Some(audio_ep) = audio_endpoint.as_ref() {
                 latest_volume = audio_ep.sample().ok();
@@ -966,7 +976,7 @@ fn main() -> anyhow::Result<()> {
                     &sys,
                     latest_gpu_percent,
                     &latest_gpu_data,
-                    latest_net_kb,
+                    net_peak_kb,
                     latest_cpu_temp,
                     latest_cpu_power,
                     ai,
@@ -1024,7 +1034,7 @@ fn main() -> anyhow::Result<()> {
                     &sys,
                     latest_gpu_percent,
                     &latest_gpu_data,
-                    latest_net_kb,
+                    net_peak_kb,
                     latest_cpu_temp,
                     latest_cpu_power,
                     ai,
