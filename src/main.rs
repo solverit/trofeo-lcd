@@ -1599,7 +1599,8 @@ fn draw_grid_layout(
         let usable_w = width.saturating_sub(side_margin * 2);
         let cols = 4u32;
         let panel_w = (usable_w.saturating_sub(gap * (cols - 1))) / cols;
-        let top_row_h = (area_height.saturating_sub(gap)) * 58 / 100;
+        // Baris atas 1/3 tinggi layar, baris bawah (AI) 2/3.
+        let top_row_h = (area_height.saturating_sub(gap)) / 3;
         let ai_row_h = area_height.saturating_sub(gap).saturating_sub(top_row_h);
 
         for (col, (label, big, cells)) in metric_panels.iter().enumerate() {
