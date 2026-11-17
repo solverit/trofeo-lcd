@@ -1219,7 +1219,8 @@ fn draw_grid_layout(
     let border = accent_color(color_mode);
     let panel_bg = (0x14u8, 0x14u8, 0x1Cu8);
     let label_color = (0xA0u8, 0xA0u8, 0xA8u8);
-    let value_color = (0xF0u8, 0xF0u8, 0xF0u8);
+    // Hijau terminal (diminta: nilai putih -> hijau di atas latar gelap).
+    let value_color = (0x00u8, 0xE0u8, 0x64u8);
     let border_thickness = 4u32;
 
     let cpu = sys.global_cpu_info().cpu_usage();
@@ -2293,7 +2294,8 @@ fn draw_game_dashboard(
     // gelap, persis kebalikan dari yang diinginkan.
     let panel_bg = (0x14u8, 0x14u8, 0x1Cu8);
     let label_color = (0xA0u8, 0xA0u8, 0xA8u8);
-    let value_color = (0xF0u8, 0xF0u8, 0xF0u8);
+    // Hijau terminal (sama dengan grid dashboard).
+    let value_color = (0x00u8, 0xE0u8, 0x64u8);
     let border_thickness = 2u32;
 
     struct Panel {
