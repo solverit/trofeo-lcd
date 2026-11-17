@@ -23,6 +23,10 @@ openrgb2 = "0.3"
 hidapi = "2"
 rusb = { version = "0.9", features = ["vendored"] }
 rustfft = "6.4.1"
+# Parse respons JSON dari API InferRig (status & telemetry llama.cpp) —
+# dipakai modul src/inferrig.rs untuk panel AI INFERENCE di layar.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sysinfo = { version = "0.30", default-features = false }
 thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "net", "time"] }

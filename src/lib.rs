@@ -45,6 +45,7 @@ use thiserror::Error;
 
 mod font;
 pub mod dxgi_capture;
+pub mod hid_lcd;
 pub mod hotkey;
 /// Decoder JPEG untuk `--background` (baseline + progressive).
 pub mod jpeg_decode;
@@ -82,6 +83,8 @@ pub enum LcdError {
     NotFound,
     #[error("handshake gagal, respons tidak valid: {0:02x?}")]
     BadHandshake(Vec<u8>),
+    #[error("perangkat HID (0416:5302): {0}")]
+    Hid(String),
     #[error("frame kosong")]
     EmptyFrame,
     #[error("frame {0} byte melebihi batas firmware {MAX_FRAME_BYTES} byte")]

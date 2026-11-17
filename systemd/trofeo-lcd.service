@@ -1,14 +1,16 @@
 [Unit]
-Description=Trofeo Vision LCD (bar EQ + info sistem)
-# Tunggu sesi grafis (X11/Wayland) siap dulu — audio (PulseAudio/PipeWire)
-# dan mode game (X11) butuh sesi ini sudah jalan.
+Description=Trofeo Vision LCD (info sistem + panel AI INFERENCE InferRig)
+# Tunggu sesi grafis (X11/Wayland) siap dulu — integrasi media (mode game,
+# X11) butuh sesi ini sudah jalan. InferRig (jika jalan sebagai user unit
+# sendiri) tidak jadi dependency keras: panel AI otomatis menampilkan
+# OFFLINE kalau API-nya belum siap, lalu pulih sendiri.
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 # GANTI path ini ke lokasi binary hasil `cargo build --release` kamu.
-# Contoh kalau proyek ada di ~/trofeo-lcd/trofeo-lcd:
-ExecStart=%h/trofeo-lcd/trofeo-lcd/target/release/trofeo_lcd
+# Contoh kalau proyek ada di ~/Projects/trofeo-lcd:
+ExecStart=%h/Projects/trofeo-lcd/target/release/trofeo_lcd --no-audio --idle-fps 3
 Restart=on-failure
 RestartSec=3
 

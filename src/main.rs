@@ -31,6 +31,7 @@ mod deepcool;
 mod foreground;
 mod gpu;
 mod gpu_amd;
+mod inferrig;
 mod media;
 mod netdisk;
 mod openrgb_sync;
@@ -43,6 +44,7 @@ use chrono::Local;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 use sysinfo::System;
+use trofeo_lcd::hid_lcd::HidLcd;
 use trofeo_lcd::{Framebuffer, LyLcd, Resolution, Rotation, TROFEO_VISION_9_16};
 use trofeo_lcd::{hotkey, png_save};
 
@@ -205,6 +207,17 @@ struct Config {
     rotation: Rotation,
     /// Tampilan lama (bar EQ / jam idle / dashboard). Default: grid layout baru.
     classic: bool,
+    /// Matikan semua jalur audio/media: tanpa capture loopback, tanpa
+    /// watcher judul lagu, tanpa pembacaan volume master. Dipakai kalau
+    /// layar hanya untuk monitoring sistem (bukan visualizer musik).
+    no_audio: bool,
+    /// Base URL API InferRig (control plane llama.cpp) untuk panel
+    /// "AI INFERENCE" — `None` berarti panel dimatikan (`--no-inferrig`).
+    /// Default: `http://127.0.0.1:5577`.
+    inferrig_url: Option<String>,
+    /// Override manual rotasi wire untuk panel HID 0416:5302 (derajat
+    /// 0/90/180/270). `None` = pakai hasil tabel dari byte PM/SUB handshake.
+    hid_rotate: Option<u32>,
 }
 
 fn print_help() {
@@ -261,6 +274,13 @@ fn print_help() {
          \x20\x20                          (default: 0 / tidak diputar).\n\
          \x20\x20--classic                 Pakai tampilan lama (bar EQ / jam idle /\n\
          \x20\x20                          dashboard). Default: grid layout baru.\n\
+         \x20\x20--no-audio                Matikan capture audio + panel musik (tanpa\n\
+         \x20\x20                          WASAPI/PulseAudio, tanpa now-playing).\n\
+         \x20\x20--inferrig-url <URL>      Base URL API InferRig untuk panel AI\n\
+         \x20\x20                          INFERENCE (default: http://127.0.0.1:5577).\n\
+         \x20\x20--no-inferrig             Matikan panel AI INFERENCE (InferRig).\n\
+         \x20\x20--hid-rotate <DERAJAT>    Override rotasi wire panel HID 0416:5302\n\
+         \x20\x20                          (0/90/180/270; default: dari handshake).\n\
          \x20\x20-h, --help                Tampilkan bantuan ini"
     );
 }
@@ -343,6 +363,9 @@ fn parse_args() -> anyhow::Result<Config> {
     let mut screenshot_key: Option<(u32, String)> = None;
     let mut rotation = Rotation::Deg0;
     let mut classic = false;
+    let mut no_audio = false;
+    let mut inferrig_url: Option<String> = Some("http://127.0.0.1:5577".to_string());
+    let mut hid_rotate: Option<u32> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -415,6 +438,29 @@ fn parse_args() -> anyhow::Result<Config> {
                 rotation = parse_rotation(deg)?;
             }
             "--classic" => classic = true,
+            "--no-audio" => no_audio = true,
+            "--no-inferrig" => inferrig_url = None,
+            "--inferrig-url" => {
+                let raw = args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--inferrig-url butuh satu nilai setelahnya")
+                })?;
+                if raw.trim().is_empty() {
+                    anyhow::bail!("--inferrig-url tidak boleh kosong");
+                }
+                inferrig_url = Some(raw);
+            }
+            "--hid-rotate" => {
+                let raw = args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--hid-rotate butuh satu nilai derajat setelahnya (0, 90, 180, 270)")
+                })?;
+                let deg: u32 = raw.parse().map_err(|_| {
+                    anyhow::anyhow!("--hid-rotate: '{raw}' bukan angka yang valid")
+                })?;
+                if !matches!(deg, 0 | 90 | 180 | 270) {
+                    anyhow::bail!("--hid-rotate harus 0, 90, 180, atau 270");
+                }
+                hid_rotate = Some(deg);
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -451,6 +497,9 @@ fn parse_args() -> anyhow::Result<Config> {
         screenshot_key,
         rotation,
         classic,
+        no_audio,
+        inferrig_url,
+        hid_rotate,
     })
 }
 
@@ -506,9 +555,63 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let lcd = LyLcd::open()?;
-    let hs = lcd.handshake()?;
-    println!("Terhubung: {:?}, PM={} SUB={}", lcd.variant(), hs.pm, hs.sub);
+    // Deteksi layar: coba dulu varian bulk "LY" (0416:5408/5409 — Trofeo
+    // Vision 9.16 revisi lama), kalau tidak ada fallback ke varian HID
+    // (0416:5302 "Winbond USBDISPLAY" — firmware revisi baru, mis. unit
+    // Trofeo Vision lain; protokol HID report 512-byte, lihat src/hid_lcd.rs).
+    enum Screen {
+        Ly(LyLcd),
+        Hid(HidLcd),
+    }
+    impl Screen {
+        fn resolution(&self) -> Resolution {
+            match self {
+                Screen::Ly(_) => TROFEO_VISION_9_16,
+                Screen::Hid(lcd) => lcd.resolution(),
+            }
+        }
+
+        fn send_framebuffer(
+            &self,
+            fb: &Framebuffer,
+            quality: u8,
+            rotation: Rotation,
+        ) -> anyhow::Result<()> {
+            match self {
+                Screen::Ly(lcd) => Ok(lcd.send_framebuffer(fb, quality, rotation)?),
+                Screen::Hid(lcd) => Ok(lcd.send_framebuffer(fb, quality, rotation)?),
+            }
+        }
+    }
+
+    let screen = match LyLcd::open() {
+        Ok(lcd) => {
+            let hs = lcd.handshake()?;
+            println!(
+                "Terhubung (LY bulk, {:?}): PM={} SUB={}",
+                lcd.variant(),
+                hs.pm,
+                hs.sub
+            );
+            Screen::Ly(lcd)
+        }
+        Err(ly_err) => {
+            println!(
+                "Perangkat LY bulk tidak ditemukan ({ly_err}); coba varian HID 0416:5302…"
+            );
+            let lcd = HidLcd::open(config.hid_rotate).map_err(|e| {
+                anyhow::anyhow!("tidak ada layar Thermalright (LY maupun HID) yang bisa dibuka: {e}")
+            })?;
+            let hs = lcd.handshake_info();
+            println!(
+                "Terhubung (HID 0416:5302): PM={} SUB={} → {}x{}, rotasi wire {}°",
+                hs.pm, hs.sub, hs.width, hs.height, hs.wire_rotation
+            );
+            Screen::Hid(lcd)
+        }
+    };
+    let resolution = screen.resolution();
+    println!("Resolusi framebuffer: {}x{}", resolution.width, resolution.height);
     println!(
         "FPS: idle={:.1} aktif={:.1} (silence-threshold={} timeout={}ms)",
         config.idle_fps,
@@ -590,18 +693,20 @@ fn main() -> anyhow::Result<()> {
     let gpu_amd = gpu_amd::GpuAmdSensor::new();
     let mut latest_gpu_data = gpu_amd::GpuAmdData::default();
 
-    let audio_ring = audio::spawn_capture()?;
+    let audio_ring = if config.no_audio {
+        println!("Audio: dinonaktifkan (--no-audio) — tanpa capture, volume, dan now-playing.");
+        audio::dummy_ring()
+    } else {
+        audio::spawn_capture()?
+    };
 
     // Background dimuat SEKALI di sini: decode + cover-crop + pencarian
     // quality JPEG_relative mahal (~1 detik), tidak boleh diulang tiap frame.
     let background = match config.background.as_deref() {
         None => None,
         Some(path) => {
-            let portrait_res = Resolution::new(
-                TROFEO_VISION_9_16.height,
-                TROFEO_VISION_9_16.width,
-            );
-            match background::load(path, TROFEO_VISION_9_16, portrait_res, config.background_dim) {
+            let portrait_res = Resolution::new(resolution.height, resolution.width);
+            match background::load(path, resolution, portrait_res, config.background_dim) {
                 Ok(bg) => {
                     println!(
                         "Background: {} (quality JPEG {}, muat dalam batas firmware)",
@@ -637,15 +742,35 @@ fn main() -> anyhow::Result<()> {
         eprintln!("PERINGATAN: GPU usage tidak tersedia di sistem ini, baris info akan menampilkan N/A.");
     }
     let mut netdisk_monitor = netdisk::NetDiskMonitor::new();
-    let audio_endpoint = media::AudioMonitor::new().ok();
+    let audio_endpoint = if config.no_audio {
+        None
+    } else {
+        media::AudioMonitor::new().ok()
+    };
     if audio_endpoint.is_none() {
         eprintln!("PERINGATAN: volume master tidak terbaca, baris info akan menampilkan N/A.");
     }
-    let now_playing = media::spawn_now_playing_watcher()?;
+    let now_playing: media::SharedNowPlaying = if config.no_audio {
+        Arc::new(Mutex::new(None))
+    } else {
+        media::spawn_now_playing_watcher()?
+    };
     let mut now_playing_marquee = Marquee::new();
     // Marquee terpisah untuk tanggal di portrait: state tidak boleh bercampur
     // dengan judul lagu yang juga sedang scroll.
     let mut date_marquee = Marquee::new();
+
+    // Panel AI INFERENCE: polling status + telemetry InferRig (control plane
+    // llama.cpp) di thread background — kalau servernya mati, panel cuma
+    // menampilkan OFFLINE, program tetap jalan.
+    let inferrig_state = config.inferrig_url.as_ref().map(|url| {
+        println!(
+            "InferRig: polling {url} tiap {} ms",
+            inferrig::DEFAULT_POLL_INTERVAL.as_millis()
+        );
+        inferrig::spawn(url.clone(), inferrig::DEFAULT_POLL_INTERVAL)
+    });
+    let offline_ai = inferrig::InferrigState::default();
 
     let mut latest_gpu_percent: Option<f32> = None;
     let mut latest_net_kb = (0.0f64, 0.0f64); // (down, up)
@@ -655,7 +780,6 @@ fn main() -> anyhow::Result<()> {
     let mut latest_cpu_power: Option<f32> = None; // Watt
     let mut latest_cpu_mhz: Option<u32> = None; // frekuensi real-time
 
-    let resolution = TROFEO_VISION_9_16;
     let mut sys = System::new_all();
     sys.refresh_all();
     let mut last_sysinfo_refresh = Instant::now();
@@ -787,12 +911,17 @@ fn main() -> anyhow::Result<()> {
             None => config.color_mode,
         };
 
+        // Snapshot data InferRig terbaru untuk frame ini (clone murah; kalau
+        // polling dimatikan, pakai state offline statis).
+        let ai_snapshot = inferrig_state.as_ref().map(inferrig::snapshot);
+        let ai = ai_snapshot.as_ref().unwrap_or(&offline_ai);
+
         apply_background(&mut fb, background.as_ref(), false);
 
         if is_portrait(config.rotation) {
             let mut portrait_fb = Framebuffer::new(Resolution::new(
-                TROFEO_VISION_9_16.height,
-                TROFEO_VISION_9_16.width,
+                resolution.height,
+                resolution.width,
             ));
             apply_background(&mut portrait_fb, background.as_ref(), true);
 
@@ -844,11 +973,10 @@ fn main() -> anyhow::Result<()> {
                     latest_cpu_temp,
                     latest_cpu_power,
                     latest_cpu_mhz,
-                    now_playing_title.as_deref(),
+                    ai,
                     &mut now_playing_marquee,
                     color_mode,
                     config.rotation,
-                    &bar_heights,
                 );
             }
 
@@ -907,17 +1035,16 @@ fn main() -> anyhow::Result<()> {
                     latest_cpu_temp,
                     latest_cpu_power,
                     latest_cpu_mhz,
-                    now_playing_title.as_deref(),
+                    ai,
                     &mut now_playing_marquee,
                     color_mode,
                     config.rotation,
-                    &bar_heights,
                 );
             }
         }
 
         // 4) Kirim ke layar.
-        lcd.send_framebuffer(&fb, jpeg_quality, config.rotation)?;
+        screen.send_framebuffer(&fb, jpeg_quality, config.rotation)?;
 
         // 5) Atur kecepatan biar mendekati `target_fps` saat ini (idle atau
         // aktif — bisa beda tiap iterasi), tanpa memaksa kalau memang lebih
@@ -1063,6 +1190,7 @@ fn draw_bars(
 
 /// Layout grid kotak-kotak (default baru). Menampilkan info sistem dalam
 /// kotak-kotak terstruktur, dengan bar EQ mini di bagian bawah.
+#[allow(clippy::too_many_arguments)]
 fn draw_grid_layout(
     fb: &mut Framebuffer,
     sys: &System,
@@ -1075,11 +1203,10 @@ fn draw_grid_layout(
     cpu_temp: Option<f32>,
     cpu_power: Option<f32>,
     cpu_mhz: Option<u32>,
-    now_playing: Option<&str>,
+    ai: &inferrig::InferrigState,
     marquee: &mut Marquee,
     color_mode: ColorMode,
     rotation: Rotation,
-    bar_heights: &[f32],
 ) {
     let width = fb.width();
     let height = fb.height();
@@ -1129,7 +1256,6 @@ fn draw_grid_layout(
         Some((pct, false)) => format!("{pct:.0}%"),
         None => "N/A".to_string(),
     };
-    let song_str = now_playing.unwrap_or("-");
 
     if is_portrait(rotation) {
         let margin = 8u32;
@@ -1161,7 +1287,7 @@ fn draw_grid_layout(
             Panel { label: "MEM", value: format!("{used_mb}MB"), detail: format!("{total_mb}MB") },
             Panel { label: "ACTIVITY", value: String::new(), detail: String::new() },
             Panel { label: "DATE TIME", value: volume_str.clone(), detail: format!("{time_str}|{date_str}") },
-            Panel { label: "NOW PLAYING", value: song_str.to_string(), detail: String::new() },
+            Panel { label: "AI INFERENCE", value: String::new(), detail: String::new() },
         ];
 
         let date_row_shrink = 70u32;
@@ -1488,41 +1614,84 @@ fn draw_grid_layout(
                     let lower_h = inner_bottom.saturating_sub(inner_top + half_h);
                     let dy = inner_top + half_h + (lower_h.saturating_sub(Framebuffer::text_height(date_scale)) / 2);
                     fb.draw_text(dx, dy, &date_str, value_color.0, value_color.1, value_color.2, date_scale);
-                } else if panel.label == "NOW PLAYING" {
-                    let song_area_h = Framebuffer::text_height(song_scale) + border_thickness * 2 + 24;
-                    let bars_area_h = (inner_h - song_area_h).saturating_sub(border_thickness);
+                } else if panel.label == "AI INFERENCE" {
+                    // Baris atas: model + state (marquee kalau kepanjangan),
+                    // di bawahnya sel GEN / PROMPT / REQ / VRAM dari InferRig.
+                    let model_area_h =
+                        Framebuffer::text_height(song_scale) + border_thickness * 2 + 20;
+                    let cells_area_h = (inner_h - model_area_h).saturating_sub(border_thickness);
 
-                    fb.fill_rect(inner_x, inner_y, inner_w, song_area_h, border.0, border.1, border.2);
-                    fb.fill_rect(inner_x + border_thickness, inner_y + border_thickness, inner_w.saturating_sub(border_thickness * 2), song_area_h.saturating_sub(border_thickness * 2), panel_bg.0, panel_bg.1, panel_bg.2);
+                    fb.fill_rect(inner_x, inner_y, inner_w, model_area_h, border.0, border.1, border.2);
+                    fb.fill_rect(
+                        inner_x + border_thickness,
+                        inner_y + border_thickness,
+                        inner_w.saturating_sub(border_thickness * 2),
+                        model_area_h.saturating_sub(border_thickness * 2),
+                        panel_bg.0, panel_bg.1, panel_bg.2,
+                    );
 
+                    let (model_text, m_color) = if ai.online() {
+                        (
+                            format!("{} [{}]", ai.model, ai.state),
+                            (value_color.0, value_color.1, value_color.2),
+                        )
+                    } else {
+                        (
+                            "INFERRIG OFFLINE".to_string(),
+                            (label_color.0, label_color.1, label_color.2),
+                        )
+                    };
                     let clip_x0 = inner_x + border_thickness + 4;
                     let clip_x1 = (inner_x + inner_w).saturating_sub(border_thickness + 4);
                     let available_width = clip_x1.saturating_sub(clip_x0);
                     let song_h = Framebuffer::text_height(song_scale);
-                    let song_y = inner_y + (song_area_h.saturating_sub(song_h) / 2);
-                    if available_width > 0 && marquee.tick(&panel.value, available_width, song_scale) {
-                        let loop_text = format!("{}{}", panel.value, MARQUEE_GAP);
+                    let song_y = inner_y + border_thickness + (model_area_h.saturating_sub(border_thickness + song_h)) / 2;
+                    if available_width > 0 && marquee.tick(&model_text, available_width, song_scale) {
+                        let loop_text = format!("{}{}", model_text, MARQUEE_GAP);
                         let loop_width = Framebuffer::text_width(&loop_text, song_scale) as i64;
                         let base_x = clip_x0 as i64 - marquee.offset_px as i64;
-                        fb.draw_text_clipped(base_x, song_y, &loop_text, value_color.0, value_color.1, value_color.2, song_scale, clip_x0, clip_x1);
-                        fb.draw_text_clipped(base_x + loop_width, song_y, &loop_text, value_color.0, value_color.1, value_color.2, song_scale, clip_x0, clip_x1);
+                        fb.draw_text_clipped(base_x, song_y, &loop_text, m_color.0, m_color.1, m_color.2, song_scale, clip_x0, clip_x1);
+                        fb.draw_text_clipped(base_x + loop_width, song_y, &loop_text, m_color.0, m_color.1, m_color.2, song_scale, clip_x0, clip_x1);
                     } else {
-                        let tw = Framebuffer::text_width(&panel.value, song_scale);
+                        let tw = Framebuffer::text_width(&model_text, song_scale);
                         let tx = inner_x + (inner_w.saturating_sub(tw) / 2);
-                        fb.draw_text(tx, song_y, &panel.value, value_color.0, value_color.1, value_color.2, song_scale);
+                        fb.draw_text(tx, song_y, &model_text, m_color.0, m_color.1, m_color.2, song_scale);
                     }
 
-                    let bar_gap = 2u32;
-                    let total_gap = bar_gap * (bar_heights.len() as u32 + 1);
-                    let bars_w = inner_w.saturating_sub(border_thickness * 2);
-                    let bar_width = (bars_w.saturating_sub(total_gap)) / bar_heights.len() as u32;
-                    let mut bx = inner_x + border_thickness + bar_gap;
-                    for &h in bar_heights {
-                        let bar_h = (bars_area_h as f32 * h).round() as u32;
-                        let bar_y = inner_y + song_area_h + (bars_area_h - bar_h);
-                        let (r, g, b) = level_color(h, color_mode);
-                        fb.fill_rect(bx, bar_y, bar_width, bar_h, r, g, b);
-                        bx += bar_width + bar_gap;
+                    let online = ai.online();
+                    let cells: [(&str, String); 4] = [
+                        ("GEN", if online { format!("{:.1} T/S", ai.gen_tps) } else { "N/A".to_string() }),
+                        ("PROMPT", if online { format!("{:.1} T/S", ai.prompt_tps) } else { "N/A".to_string() }),
+                        ("REQ", if online { format!("{}+{}", ai.requests_active, ai.requests_queued) } else { "N/A".to_string() }),
+                        ("VRAM", if online { format!("{:.1}G", ai.gpu_mem_used_bytes / 1024.0 / 1024.0 / 1024.0) } else { "N/A".to_string() }),
+                    ];
+                    let cell_h = (cells_area_h + border_thickness * 3) / 4;
+                    for (cidx, (sub_label, sub_value)) in cells.iter().enumerate() {
+                        let sy = inner_y + model_area_h + cidx as u32 * cell_h.saturating_sub(border_thickness);
+                        let ch = if cidx == 3 { inner_y + inner_h - sy } else { cell_h };
+
+                        fb.fill_rect(inner_x, sy, inner_w, ch, border.0, border.1, border.2);
+                        fb.fill_rect(
+                            inner_x + border_thickness,
+                            sy + border_thickness,
+                            inner_w.saturating_sub(border_thickness * 2),
+                            ch.saturating_sub(border_thickness * 2),
+                            panel_bg.0, panel_bg.1, panel_bg.2,
+                        );
+
+                        let sub_lab_scale = fit_text_scale(sub_label, inner_w.saturating_sub(border_thickness * 2), detail_scale);
+                        let slw = Framebuffer::text_width(sub_label, sub_lab_scale);
+                        let slx = inner_x + (inner_w.saturating_sub(slw) / 2);
+                        let sly = sy + border_thickness + 2;
+                        fb.draw_text(slx, sly, sub_label, label_color.0, label_color.1, label_color.2, sub_lab_scale);
+
+                        let sub_val_scale = fit_text_scale(sub_value, inner_w.saturating_sub(border_thickness * 2 + 4), detail_scale);
+                        let svw = Framebuffer::text_width(sub_value, sub_val_scale);
+                        let svx = inner_x + (inner_w.saturating_sub(svw) / 2);
+                        let value_top = sly + Framebuffer::text_height(sub_lab_scale);
+                        let value_bottom = (sy + ch).saturating_sub(border_thickness + 2);
+                        let svy = value_top + (value_bottom.saturating_sub(value_top + Framebuffer::text_height(sub_val_scale))) / 2;
+                        fb.draw_text(svx, svy, sub_value, value_color.0, value_color.1, value_color.2, sub_val_scale);
                     }
                 } else {
                     let sub_count = if panel.detail.is_empty() { 1 } else { 2 };
@@ -1580,7 +1749,7 @@ fn draw_grid_layout(
             Panel { label: "MEM", value: format!("{used_mb}MB"), detail: format!("{total_mb}MB") },
             Panel { label: "ACTIVITY", value: String::new(), detail: String::new() },
             Panel { label: "DATE TIME", value: volume_str.clone(), detail: format!("{time_str}|{date_str}") },
-            Panel { label: "NOW PLAYING", value: song_str.to_string(), detail: String::new() },
+            Panel { label: "AI INFERENCE", value: String::new(), detail: String::new() },
         ];
 
         let mut idx = 0;
@@ -1935,41 +2104,87 @@ fn draw_grid_layout(
                     fb.fill_rect(grid_x, inner_y + sub_h.saturating_sub(border_thickness), sub_w, date_box_h, border.0, border.1, border.2);
                     fb.fill_rect(grid_x + border_thickness, inner_y + sub_h, sub_w.saturating_sub(border_thickness * 2), date_box_h.saturating_sub(border_thickness * 2), panel_bg.0, panel_bg.1, panel_bg.2);
                     fb.draw_text(dx, dy, &date_val, value_color.0, value_color.1, value_color.2, date_scale);
-                } else if panel.label == "NOW PLAYING" {
-                    let song_area_h = inner_h / 2;
-                    let bars_area_h = (inner_h - song_area_h).saturating_sub(border_thickness);
+                } else if panel.label == "AI INFERENCE" {
+                    // Baris atas: model + state (marquee kalau kepanjangan),
+                    // di bawahnya grid 2x2: GEN / PROMPT / REQ / VRAM InferRig.
+                    let model_area_h =
+                        Framebuffer::text_height(song_scale) + border_thickness * 2 + 24;
+                    let cells_area_h = (inner_h - model_area_h).saturating_sub(border_thickness);
 
-                    fb.fill_rect(inner_x, inner_y, inner_w, song_area_h, border.0, border.1, border.2);
-                    fb.fill_rect(inner_x + border_thickness, inner_y + border_thickness, inner_w.saturating_sub(border_thickness * 2), song_area_h.saturating_sub(border_thickness * 2), panel_bg.0, panel_bg.1, panel_bg.2);
+                    fb.fill_rect(inner_x, inner_y, inner_w, model_area_h, border.0, border.1, border.2);
+                    fb.fill_rect(
+                        inner_x + border_thickness,
+                        inner_y + border_thickness,
+                        inner_w.saturating_sub(border_thickness * 2),
+                        model_area_h.saturating_sub(border_thickness * 2),
+                        panel_bg.0, panel_bg.1, panel_bg.2,
+                    );
 
+                    let (model_text, m_color) = if ai.online() {
+                        (
+                            format!("{} [{}]", ai.model, ai.state),
+                            (value_color.0, value_color.1, value_color.2),
+                        )
+                    } else {
+                        (
+                            "INFERRIG OFFLINE".to_string(),
+                            (label_color.0, label_color.1, label_color.2),
+                        )
+                    };
                     let clip_x0 = inner_x + border_thickness + 4;
                     let clip_x1 = (inner_x + inner_w).saturating_sub(border_thickness + 4);
                     let available_width = clip_x1.saturating_sub(clip_x0);
                     let song_h = Framebuffer::text_height(song_scale);
-                    let song_y = inner_y + (song_area_h.saturating_sub(song_h) / 2);
-                    if available_width > 0 && marquee.tick(&panel.value, available_width, song_scale) {
-                        let loop_text = format!("{}{}", panel.value, MARQUEE_GAP);
+                    let song_y = inner_y + border_thickness + (model_area_h.saturating_sub(border_thickness + song_h)) / 2;
+                    if available_width > 0 && marquee.tick(&model_text, available_width, song_scale) {
+                        let loop_text = format!("{}{}", model_text, MARQUEE_GAP);
                         let loop_width = Framebuffer::text_width(&loop_text, song_scale) as i64;
                         let base_x = clip_x0 as i64 - marquee.offset_px as i64;
-                        fb.draw_text_clipped(base_x, song_y, &loop_text, value_color.0, value_color.1, value_color.2, song_scale, clip_x0, clip_x1);
-                        fb.draw_text_clipped(base_x + loop_width, song_y, &loop_text, value_color.0, value_color.1, value_color.2, song_scale, clip_x0, clip_x1);
+                        fb.draw_text_clipped(base_x, song_y, &loop_text, m_color.0, m_color.1, m_color.2, song_scale, clip_x0, clip_x1);
+                        fb.draw_text_clipped(base_x + loop_width, song_y, &loop_text, m_color.0, m_color.1, m_color.2, song_scale, clip_x0, clip_x1);
                     } else {
-                        let tw = Framebuffer::text_width(&panel.value, song_scale);
+                        let tw = Framebuffer::text_width(&model_text, song_scale);
                         let tx = inner_x + (inner_w.saturating_sub(tw) / 2);
-                        fb.draw_text(tx, song_y, &panel.value, value_color.0, value_color.1, value_color.2, song_scale);
+                        fb.draw_text(tx, song_y, &model_text, m_color.0, m_color.1, m_color.2, song_scale);
                     }
 
-                    let bar_gap = 2u32;
-                    let total_gap = bar_gap * (bar_heights.len() as u32 + 1);
-                    let bars_w = inner_w.saturating_sub(border_thickness * 2);
-                    let bar_width = (bars_w.saturating_sub(total_gap)) / bar_heights.len() as u32;
-                    let mut bx = inner_x + border_thickness + bar_gap;
-                    for &h in bar_heights {
-                        let bar_h = (bars_area_h as f32 * h).round() as u32;
-                        let bar_y = inner_y + song_area_h + (bars_area_h - bar_h);
-                        let (r, g, b) = level_color(h, color_mode);
-                        fb.fill_rect(bx, bar_y, bar_width, bar_h, r, g, b);
-                        bx += bar_width + bar_gap;
+                    let online = ai.online();
+                    let cells: [(&str, String); 4] = [
+                        ("GEN", if online { format!("{:.1} T/S", ai.gen_tps) } else { "N/A".to_string() }),
+                        ("PROMPT", if online { format!("{:.1} T/S", ai.prompt_tps) } else { "N/A".to_string() }),
+                        ("REQ", if online { format!("{}+{}", ai.requests_active, ai.requests_queued) } else { "N/A".to_string() }),
+                        ("VRAM", if online { format!("{:.1}G", ai.gpu_mem_used_bytes / 1024.0 / 1024.0 / 1024.0) } else { "N/A".to_string() }),
+                    ];
+                    let cell_w = (inner_w + border_thickness) / 2;
+                    let cell_h = (cells_area_h + border_thickness) / 2;
+                    for (cidx, (sub_label, sub_value)) in cells.iter().enumerate() {
+                        let sx = inner_x + (cidx % 2) as u32 * cell_w.saturating_sub(border_thickness);
+                        let sy = inner_y + model_area_h + (cidx / 2) as u32 * cell_h.saturating_sub(border_thickness);
+                        let cw = if cidx % 2 == 1 { inner_x + inner_w - sx } else { cell_w };
+                        let ch = if cidx / 2 == 1 { inner_y + inner_h - sy } else { cell_h };
+
+                        fb.fill_rect(sx, sy, cw, ch, border.0, border.1, border.2);
+                        fb.fill_rect(
+                            sx + border_thickness,
+                            sy + border_thickness,
+                            cw.saturating_sub(border_thickness * 2),
+                            ch.saturating_sub(border_thickness * 2),
+                            panel_bg.0, panel_bg.1, panel_bg.2,
+                        );
+
+                        let sub_lab_scale = fit_text_scale(sub_label, cw.saturating_sub(border_thickness * 2), detail_scale);
+                        let slw = Framebuffer::text_width(sub_label, sub_lab_scale);
+                        let slx = sx + (cw.saturating_sub(slw) / 2);
+                        let sly = sy + border_thickness + 2;
+                        fb.draw_text(slx, sly, sub_label, label_color.0, label_color.1, label_color.2, sub_lab_scale);
+
+                        let sub_val_scale = fit_text_scale(sub_value, cw.saturating_sub(border_thickness * 2 + 4), value_scale.saturating_sub(1));
+                        let svw = Framebuffer::text_width(sub_value, sub_val_scale);
+                        let svx = sx + (cw.saturating_sub(svw) / 2);
+                        let value_top = sly + Framebuffer::text_height(sub_lab_scale) + 2;
+                        let value_bottom = (sy + ch).saturating_sub(border_thickness + 2);
+                        let svy = value_top + (value_bottom.saturating_sub(value_top + Framebuffer::text_height(sub_val_scale))) / 2;
+                        fb.draw_text(svx, svy, sub_value, value_color.0, value_color.1, value_color.2, sub_val_scale);
                     }
                 } else {
                     let sub_count = if panel.detail.is_empty() { 1 } else { 2 };
@@ -2630,6 +2845,22 @@ mod grid_preview {
         let mut marquee = Marquee::new();
         let sys = System::new();
 
+        let ai = inferrig::InferrigState {
+            state: "ready".to_string(),
+            model: "unsloth-ud-iq4-xs-qwen3-8-flash-next".to_string(),
+            profile: "qwen38-flash-next".to_string(),
+            gen_tps: 42.7,
+            prompt_tps: 1289.4,
+            requests_active: 2,
+            requests_queued: 1,
+            context_peak: 9000,
+            context_configured: 87552,
+            gpu_mem_used_bytes: 68.7 * 1024.0 * 1024.0 * 1024.0,
+            gpu_mem_budget_bytes: 114.0 * 1024.0 * 1024.0 * 1024.0,
+            updated: Some(std::time::Instant::now()),
+            error: None,
+        };
+
         let mut fb = Framebuffer::new(Resolution::new(462, 1920));
         draw_grid_layout(
             &mut fb, &sys, None,
@@ -2637,11 +2868,10 @@ mod grid_preview {
             (1024.0, 256.0), (12.5, 4.2),
             Some((100.0, false)),
             Some(55.0), Some(65.0), Some(4200),
-            Some("Some Song Title - Artist Name"),
+            &ai,
             &mut marquee,
             ColorMode::Default,
             Rotation::Deg90,
-            &[0.1, 0.3, 0.5, 0.9, 0.6, 0.4, 0.7],
         );
         std::fs::write("target/preview_portrait.png", png_save::encode(&fb)).unwrap();
 
@@ -2652,12 +2882,26 @@ mod grid_preview {
             (1024.0, 256.0), (12.5, 4.2),
             Some((100.0, false)),
             Some(55.0), Some(65.0), Some(4200),
-            Some("Some Song Title - Artist Name"),
+            &ai,
             &mut marquee,
             ColorMode::Default,
             Rotation::Deg0,
-            &[0.1, 0.3, 0.5, 0.9, 0.6, 0.4, 0.7],
         );
         std::fs::write("target/preview_landscape.png", png_save::encode(&fb2)).unwrap();
+
+        // Pratinjau ukuran panel HID 1280x480 (varian 0416:5302).
+        let mut fb3 = Framebuffer::new(Resolution::new(1280, 480));
+        draw_grid_layout(
+            &mut fb3, &sys, None,
+            Some(42.0), &gpu_data,
+            (1024.0, 256.0), (12.5, 4.2),
+            Some((100.0, false)),
+            Some(55.0), Some(65.0), Some(4200),
+            &ai,
+            &mut marquee,
+            ColorMode::Default,
+            Rotation::Deg0,
+        );
+        std::fs::write("target/preview_1280x480.png", png_save::encode(&fb3)).unwrap();
     }
 }

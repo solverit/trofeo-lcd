@@ -42,11 +42,16 @@ system status (CPU/GPU/RAM/temp) stays readable while playing.
 ## Features
 
 - **Grid dashboard** (default): panels for CPU, GPU, RAM, network/disk
-  activity, date/time/volume and now-playing, in landscape or portrait
-  (`--rotate`).
+  activity, date/time/volume and an **AI INFERENCE** panel fed by
+  [InferRig](https://github.com/) (local llama.cpp control plane), in
+  landscape or portrait (`--rotate`).
+- **Two LCD revisions supported**: the bulk "LY" protocol (`0416:5408` /
+  `0416:5409`) and the newer HID "Winbond USBDISPLAY" variant
+  (`0416:5302`, e.g. firmware 4.07) — auto-detected at startup, see
+  `src/hid_lcd.rs`.
 - EQ bars (48) from currently playing audio (WASAPI loopback on Windows,
   PulseAudio/PipeWire on Linux, Core Audio process tap on macOS), colored
-  green→yellow→red.
+  green→yellow→red. Can be turned off entirely with `--no-audio`.
 - Optional **background image** (`--background`), with the text color picked
   per line to stay readable on light photos.
 - System info: CPU %, real-time CPU frequency, RAM, uptime, clock & date.
@@ -84,6 +89,10 @@ those two fields show `N/A` and everything else works.
 | `--background-dim <0-100>` | Darken that image once at load so the text stays readable — free, no per-frame cost | `15` |
 | `--rotate <DEG>` | Rotate the screen: 0, 90, 180 or 270 | `0` |
 | `--classic` | Use the classic adaptive views (EQ bars / idle clock / game dashboard) instead of the grid dashboard | grid dashboard |
+| `--no-audio` | Disable all audio/media paths (no loopback capture, no now-playing) — for a pure system-monitor setup | audio on |
+| `--inferrig-url <URL>` | Base URL of the InferRig API for the AI INFERENCE panel | `http://127.0.0.1:5577` |
+| `--no-inferrig` | Disable the AI INFERENCE panel | panel on |
+| `--hid-rotate <DEG>` | Override the HID panel's wire rotation (0/90/180/270) if the picture ever comes out rotated | from handshake |
 | `--no-deepcool` | Turn off DeepCool integration | enabled |
 | `--deepcool-update-ms` | DeepCool send interval (100–2000 ms) | `1000` |
 | `--openrgb-device <NAME>` | Sync color with an OpenRGB device | disabled |

@@ -207,7 +207,7 @@ mod imp {
                 continue;
             }
             let path = entry.path().join("cpufreq/scaling_cur_freq");
-            if let Ok(khz) = fs::read_to_string(&path)
+            if let Some(khz) = fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
             {

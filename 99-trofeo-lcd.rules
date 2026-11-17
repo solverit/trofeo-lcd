@@ -15,3 +15,8 @@
 
 SUBSYSTEM=="usb", ATTR{idVendor}=="0416", ATTR{idProduct}=="5408", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="0416", ATTR{idProduct}=="5409", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Varian firmware HID (Winbond USBDISPLAY, mis. Trofeo Vision 9.16 revisi baru):
+# diakses lewat /dev/hidraw* (crate hidapi), bukan bulk transfer libusb.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0416", ATTR{idProduct}=="5302", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5302", MODE="0660", GROUP="plugdev", TAG+="uaccess"
