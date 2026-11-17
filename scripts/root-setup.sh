@@ -34,6 +34,10 @@ udevadm trigger --subsystem-match=usb --action=change || true
 # Re-apply ke node hidraw yang sudah ada (MODE/GROUP tidak re-evaluate
 # otomatis oleh trigger usb; jalan langsung juga pada hidraw).
 udevadm trigger --subsystem-match=hidraw --action=change || true
+# Buka akses baca counter energi RAPL (power CPU) sekarang juga, tanpa
+# menunggu event udev berikutnya.
+chmod 0444 /sys/class/powercap/intel-rapl*/energy_uj 2>/dev/null || true
 
 echo "Selesai. Cek akses:"
 ls -la /dev/hidraw* 2>/dev/null || true
+ls -la /sys/class/powercap/intel-rapl*/energy_uj 2>/dev/null || true

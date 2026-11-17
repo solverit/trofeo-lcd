@@ -20,3 +20,8 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="0416", ATTR{idProduct}=="5409", MODE="0660", 
 # diakses lewat /dev/hidraw* (crate hidapi), bukan bulk transfer libusb.
 SUBSYSTEM=="usb", ATTR{idVendor}=="0416", ATTR{idProduct}=="5302", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5302", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Counter energi RAPL (power CPU, /sys/class/powercap/intel-rapl:N/energy_uj)
+# default-nya 0400 root-only di banyak distro — buat bisa dibaca user biasa
+# (dipakai trofeo-lcd untuk panel WATT CPU, sama seperti turbostat/powerstat).
+ACTION=="add|change", SUBSYSTEM=="powercap", KERNEL=="intel-rapl*", RUN+="/bin/chmod 0444 /sys/class/powercap/%k/energy_uj"

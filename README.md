@@ -73,7 +73,11 @@ cargo build --release
 
 **Linux** — needs `pkg-config` + PulseAudio headers to build, and
 `playerctl` for song titles. For USB access without `sudo`, install
-`99-trofeo-lcd.rules` (see the file's contents).
+`99-trofeo-lcd.rules` (see the file's contents). The same rule also makes
+the RAPL energy counters (`/sys/class/powercap/intel-rapl:*/energy_uj`)
+world-readable — Ubuntu ships them root-only, and without read access the
+CPU wattage panel shows `N/A`. Running `scripts/root-setup.sh` with sudo
+installs everything in one go.
 
 **macOS** — no extra install needed: system audio comes from a Core Audio
 process tap (native since 14.2, no virtual driver and no permission prompt).
