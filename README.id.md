@@ -92,15 +92,23 @@ Opsi CLI mengesampingkan nilai dari file. Nilai lain mengikuti profil.
 
 [Pratinjau inference landscape](img/inference_landscape.png) · [Portrait](img/inference_portrait.png)
 
+Tema `monitor` menampilkan nama profil InferRig aktif, waktu sejak profil
+dimulai, dan pemakaian konteks di atas delapan grafik satu menit. Baris pertama
+menampilkan metrik GPU. Baris kedua menampilkan daya APU, beban CPU, RAM sistem,
+dan laju jaringan gabungan RX + TX. Data berasal dari `/api/status-board` pada
+host InferRig. Jalankan `trofeo_lcd --config examples/monitor.json`.
+
+[Pratinjau tema monitor (1280 × 480)](img/monitor_landscape.png)
+
 | Kunci JSON | Nilai yang diterima | Fungsi |
 |---|---|---|
 | `profile` | `"grid"`, `"inference"`, `"classic"` | Pilih grid metrik sistem, dasbor InferRig, atau tampilan adaptif EQ, jam dan gim. |
-| `theme` | `"standard"`, `"terminal"` | Gunakan aksen netral atau hijau untuk bingkai dan nilai pada dasbor. |
+| `theme` | `"standard"`, `"terminal"`, `"monitor"` | Pilih aksen netral, hijau, atau tata letak delapan grafik untuk profil inference. |
 | `idle_fps` | Angka lebih dari 0 | Target FPS saat hening atau ketika penangkapan audio dinonaktifkan. |
 | `active_fps` | Angka lebih dari 0 | Target FPS ketika penangkapan audio mendeteksi suara. |
 | `audio` | `true`, `false` | Aktifkan atau nonaktifkan penangkapan audio sistem. |
 | `inferrig_url` | String URL | Alamat dasar API InferRig untuk profil `inference`. Nilai bawaan `http://127.0.0.1:5577`. |
-| `net_peak_half_life_secs` | Angka ≥ 0, dalam detik | Pada profil `inference`, nilai puncak laju jaringan turun menjadi separuh dalam interval ini. Nilai bawaan 2. Gunakan 0 untuk menampilkan laju transfer saat ini. |
+| `net_peak_half_life_secs` | Angka ≥ 0, dalam detik | Pada panel sistem lokal profil `inference`, nilai puncak laju jaringan turun menjadi separuh dalam interval ini. Nilai bawaan 2. Gunakan 0 untuk menampilkan laju transfer saat ini. |
 
 Kunci yang tidak dikenal menyebabkan kesalahan konfigurasi. Untuk memakai semua nilai bawaan InferRig, cukup isi file dengan `{"profile": "inference"}`.
 
@@ -128,7 +136,7 @@ pengguna dan program yang dipasang lewat `cargo install --locked --path .`.
 |---|---|---|
 | `--config <PATH>` | Baca konfigurasi dasbor dari file JSON ini | lokasi konfigurasi pengguna di atas |
 | `--profile <NAMA>` | Pilih `grid`, `inference` atau `classic` | `grid` |
-| `--theme <NAMA>` | Pilih `standard` atau `terminal` | mengikuti profil |
+| `--theme <NAMA>` | Pilih `standard`, `terminal` atau `monitor` | mengikuti profil |
 | `--idle-fps <N>` / `--active-fps <N>` | Target FPS saat hening / ada suara | mengikuti profil |
 | `--silence-threshold <N>` | Ambang amplitudo puncak untuk mendeteksi hening | `0.005` |
 | `--silence-timeout-ms <N>` | Durasi hening sebelum beralih ke FPS diam, dalam milidetik | `800` |

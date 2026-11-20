@@ -5,7 +5,7 @@ use super::dashboard::{
 };
 use super::{
     format_freq_mhz, format_uptime, is_portrait, level_color, ColorMode, Framebuffer, Local,
-    Marquee, Rotation, System, MARQUEE_GAP,
+    Marquee, Rotation, System,
 };
 
 #[derive(Clone, Copy)]
@@ -213,27 +213,7 @@ fn now_playing(
     let clip = text_rect.inset(p.border_thickness + 2, p.border_thickness);
     let scale = style.label.min(clip.h / Framebuffer::text_height(1)).max(1);
     let y = clip.y + clip.h.saturating_sub(Framebuffer::text_height(scale)) / 2;
-    let (red, green, blue) = p.value_color;
-    if marquee.tick(title, clip.w, scale) {
-        let text = format!("{title}{MARQUEE_GAP}");
-        let x = clip.x as i64 - marquee.offset_px as i64;
-        for start in [x, x + Framebuffer::text_width(&text, scale) as i64] {
-            fb.draw_text_clipped(
-                start,
-                y,
-                &text,
-                red,
-                green,
-                blue,
-                scale,
-                clip.x,
-                clip.x + clip.w,
-            );
-        }
-    } else {
-        let x = clip.x + clip.w.saturating_sub(Framebuffer::text_width(title, scale)) / 2;
-        fb.draw_text(x, y, title, red, green, blue, scale);
-    }
+    marquee.draw(fb, title, Rect { y, ..clip }, scale, p.value_color, true);
     let eq = Rect {
         y: r.y + text_h,
         h: r.h - text_h,

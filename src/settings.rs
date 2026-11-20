@@ -17,6 +17,7 @@ pub enum Profile {
 pub enum Theme {
     Standard,
     Terminal,
+    Monitor,
 }
 
 #[derive(Default, Deserialize)]

@@ -91,15 +91,24 @@ CLI flags override the file. Unspecified values come from the selected profile.
 
 [Rendered inference dashboard in landscape](img/inference_landscape.png) · [Portrait](img/inference_portrait.png)
 
+The `monitor` theme shows the active InferRig profile, its run uptime and context
+occupancy above eight one-minute charts. GPU metrics occupy the first row.
+APU power, CPU load, system RAM and combined network RX + TX occupy the second.
+The values and history come from `/api/status-board` on the configured InferRig
+host. A dash indicates a missing reading. Run
+`trofeo_lcd --config examples/monitor.json` to select this layout.
+
+[Monitor theme preview (1280 × 480)](img/monitor_landscape.png)
+
 | JSON key | Accepted values | Effect |
 |---|---|---|
 | `profile` | `"grid"`, `"inference"`, `"classic"` | Select the system grid, the InferRig dashboard, or the adaptive EQ, clock and game views. |
-| `theme` | `"standard"`, `"terminal"` | Use neutral or green accents for dashboard borders and values. |
+| `theme` | `"standard"`, `"terminal"`, `"monitor"` | Use neutral or green accents, or select the eight-chart monitor layout with the inference profile. |
 | `idle_fps` | Number greater than 0 | Target frame rate during silence or whenever audio capture is off. |
 | `active_fps` | Number greater than 0 | Target frame rate when audio capture detects sound. |
 | `audio` | `true`, `false` | Enable or disable system audio capture. |
 | `inferrig_url` | URL string | Base address of the InferRig API used by the `inference` profile. Defaults to `http://127.0.0.1:5577`. |
-| `net_peak_half_life_secs` | Number ≥ 0, in seconds | In the `inference` profile, a network peak halves over this interval. The default is 2. Set to 0 to show current transfer rates. |
+| `net_peak_half_life_secs` | Number ≥ 0, in seconds | In the local system panels of the `inference` profile, a network peak halves over this interval. The default is 2. Set to 0 to show current transfer rates. |
 
 Unknown keys cause a configuration error. To use all InferRig defaults, the entire file can be `{"profile": "inference"}`.
 
@@ -127,7 +136,7 @@ this same configuration and the executable installed by `cargo install --locked 
 |---|---|---|
 | `--config <PATH>` | Read dashboard settings from this JSON file | user configuration path above |
 | `--profile <NAME>` | Select `grid`, `inference` or `classic` | `grid` |
-| `--theme <NAME>` | Select `standard` or `terminal` | profile default |
+| `--theme <NAME>` | Select `standard`, `terminal` or `monitor` | profile default |
 | `--idle-fps <N>` / `--active-fps <N>` | Target FPS during silence / sound | profile default |
 | `--silence-threshold <N>` | Peak audio amplitude below which the input counts as silent | `0.005` |
 | `--silence-timeout-ms <N>` | Continuous silence before switching to idle FPS, in milliseconds | `800` |

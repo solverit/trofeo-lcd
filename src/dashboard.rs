@@ -30,6 +30,7 @@ impl Palette {
     pub(super) fn new(theme: Theme, color: ColorMode) -> Self {
         let (border, value_color) = match theme {
             Theme::Standard => ((0xE0, 0xE0, 0xE0), (0xF0, 0xF0, 0xF0)),
+            Theme::Monitor => ((0x61, 0x71, 0x70), (0x46, 0xDB, 0xA6)),
             Theme::Terminal => ((0x06, 0x3C, 0x1C), (0x00, 0xE0, 0x64)),
         };
         Self {

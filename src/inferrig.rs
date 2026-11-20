@@ -42,8 +42,6 @@ pub struct GpuMemory {
     pub kind: Option<String>,
 }
 
-pub type SharedState = Arc<Mutex<InferrigState>>;
-
 pub fn base_url(raw: &str) -> Result<String> {
     let raw = raw.trim().trim_end_matches('/');
     let base = if raw.contains("://") {
@@ -68,7 +66,7 @@ pub fn base_url(raw: &str) -> Result<String> {
     Ok(base)
 }
 
-fn get<T: DeserializeOwned>(agent: &ureq::Agent, url: String) -> Result<T> {
+pub(super) fn get<T: DeserializeOwned>(agent: &ureq::Agent, url: String) -> Result<T> {
     let mut response = agent.get(url.as_str()).call()?;
     ensure!(
         response.status().is_success(),
@@ -82,15 +80,18 @@ fn get<T: DeserializeOwned>(agent: &ureq::Agent, url: String) -> Result<T> {
         .read_json()?)
 }
 
-fn poll(agent: &ureq::Agent, url: &str) -> InferrigState {
+pub(super) fn poll(agent: &ureq::Agent, url: &str) -> InferrigState {
     InferrigState {
         lifecycle: get(agent, format!("{url}/api/state")).ok(),
         telemetry: get(agent, format!("{url}/api/telemetry")).unwrap_or_default(),
     }
 }
 
-pub fn spawn(url: String) -> Result<SharedState> {
-    let shared = SharedState::default();
+pub fn spawn_poll<T: Default + Send + 'static>(
+    url: String,
+    poll: fn(&ureq::Agent, &str) -> T,
+) -> Result<Arc<Mutex<T>>> {
+    let shared = Arc::<Mutex<T>>::default();
     let state = shared.clone();
     std::thread::Builder::new()
         .name("inferrig-poll".into())

@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1.0"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 # Kompresi deflate/zlib (backend murni Rust miniz_oxide — tidak butuh
 # toolchain C) untuk file tangkapan layar PNG di src/png_save.rs.
 flate2 = "1"

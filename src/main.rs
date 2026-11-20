@@ -34,6 +34,7 @@ mod gpu_amd;
 mod inferrig;
 mod settings;
 mod dashboard;
+mod monitor;
 mod grid;
 use dashboard::{draw_inference, Palette, Readings};
 use settings::{Profile, Theme};
@@ -92,6 +93,43 @@ impl Marquee {
             text: String::new(),
             offset_px: 0.0,
             last_tick: Instant::now(),
+        }
+    }
+
+    fn draw(
+        &mut self,
+        fb: &mut Framebuffer,
+        title: &str,
+        clip: dashboard::Rect,
+        scale: u32,
+        color: (u8, u8, u8),
+        centered: bool,
+    ) {
+        let y = clip.y;
+        let (red, green, blue) = color;
+        if self.tick(title, clip.w, scale) {
+            let text = format!("{title}{MARQUEE_GAP}");
+            let x = clip.x as i64 - self.offset_px as i64;
+            for start in [x, x + Framebuffer::text_width(&text, scale) as i64] {
+                fb.draw_text_clipped(
+                    start,
+                    y,
+                    &text,
+                    red,
+                    green,
+                    blue,
+                    scale,
+                    clip.x,
+                    clip.x + clip.w,
+                );
+            }
+        } else {
+            let x = if centered {
+                clip.x + clip.w.saturating_sub(Framebuffer::text_width(title, scale)) / 2
+            } else {
+                clip.x
+            };
+            fb.draw_text(x, y, title, red, green, blue, scale);
         }
     }
 
@@ -236,7 +274,7 @@ fn print_help() {
          \n\
          --config <PATH>           Dashboard JSON configuration\n\
          --profile <NAME>          grid (default), inference, classic\n\
-         --theme <NAME>            standard or terminal\n\
+         --theme <NAME>            standard, terminal or monitor\n\
          --audio / --no-audio      Override configured audio capture\n\
          Opsi:\n\
          \x20\x20--idle-fps <N>            FPS saat diam (default: {DEFAULT_IDLE_FPS})\n\
@@ -472,7 +510,8 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> anyhow::Result<Con
                 theme = Some(match args.next().as_deref() {
                     Some("standard") => Theme::Standard,
                     Some("terminal") => Theme::Terminal,
-                    _ => anyhow::bail!("--theme requires standard or terminal"),
+                    Some("monitor") => Theme::Monitor,
+                    _ => anyhow::bail!("--theme requires standard, terminal or monitor"),
                 })
             }
             "--classic" => profile = Some(Profile::Classic),
@@ -511,9 +550,14 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> anyhow::Result<Con
     }
 
     let file = settings::load(config_path.as_deref())?;
-    let profile = profile.or(file.profile).unwrap_or_default();
+    let theme = theme.or(file.theme);
+    let profile = profile.or(file.profile).unwrap_or(if theme == Some(Theme::Monitor) {
+        Profile::Inference
+    } else {
+        Profile::default()
+    });
     let inference = profile == Profile::Inference;
-    let theme = theme.or(file.theme).unwrap_or(if inference {
+    let theme = theme.unwrap_or(if inference {
         Theme::Terminal
     } else {
         Theme::Standard
@@ -782,10 +826,17 @@ fn main() -> anyhow::Result<()> {
     // Panel AI INFERENCE: polling status + telemetry InferRig (control plane
     // llama.cpp) di thread background — kalau servernya mati, panel cuma
     // menampilkan OFFLINE, program tetap jalan.
+    let monitor = config
+        .inferrig_url
+        .as_ref()
+        .filter(|_| config.theme == Theme::Monitor)
+        .map(|url| inferrig::spawn_poll(url.clone(), monitor::poll))
+        .transpose()?;
     let inferrig_state = config
         .inferrig_url
         .clone()
-        .map(inferrig::spawn)
+        .filter(|_| monitor.is_none())
+        .map(|url| inferrig::spawn_poll(url, inferrig::poll))
         .transpose()?;
     let mut latest_gpu_percent: Option<f32> = None;
     let mut latest_net_kb = (0.0f64, 0.0f64);
@@ -875,7 +926,7 @@ fn main() -> anyhow::Result<()> {
         // Catatan: `System::uptime()` TIDAK ikut aturan ini — itu panggilan
         // statis yang cuma baca counter OS (bukan snapshot proses/CPU/RAM
         // yang mahal), jadi aman dipanggil tiap frame di `draw_status_line`.
-        if last_sysinfo_refresh.elapsed() >= SYSINFO_REFRESH_INTERVAL {
+        if monitor.is_none() && last_sysinfo_refresh.elapsed() >= SYSINFO_REFRESH_INTERVAL {
             // Ukur delta waktu sebelum reset — dipakai untuk hitung power Watt.
             let sysinfo_delta_ms = last_sysinfo_refresh.elapsed().as_millis() as u64;
 
@@ -947,7 +998,9 @@ fn main() -> anyhow::Result<()> {
         };
 
         let canvas = portrait_buffer.as_mut().unwrap_or(&mut fb);
-        apply_background(canvas, background.as_ref(), is_portrait(config.rotation));
+        if monitor.is_none() {
+            apply_background(canvas, background.as_ref(), is_portrait(config.rotation));
+        }
         let palette = Palette::new(config.theme, color_mode);
         let readings = Readings {
             sys: &sys,
@@ -964,8 +1017,8 @@ fn main() -> anyhow::Result<()> {
             disk: latest_disk_mb,
             volume: latest_volume,
         };
-        match config.profile {
-            Profile::Classic => {
+        match (config.profile, &monitor) {
+            (Profile::Classic, _) => {
                 if gaming_mode {
                     draw_game_dashboard(
                         canvas,
@@ -1006,7 +1059,7 @@ fn main() -> anyhow::Result<()> {
                     config.rotation,
                 );
             }
-            Profile::Grid => grid::draw(
+            (Profile::Grid, _) => grid::draw(
                 canvas,
                 &readings,
                 now_playing_title.as_deref(),
@@ -1016,7 +1069,17 @@ fn main() -> anyhow::Result<()> {
                 config.rotation,
                 &bar_heights,
             ),
-            Profile::Inference => {
+            (Profile::Inference, Some(state)) => {
+                let board = state.lock().unwrap().clone();
+                monitor::draw(
+                    canvas,
+                    board.as_deref(),
+                    chrono::Utc::now(),
+                    &mut now_playing_marquee,
+                    color_mode,
+                );
+            }
+            (Profile::Inference, None) => {
                 let ai = inferrig_state
                     .as_ref()
                     .map(|shared| shared.lock().unwrap().clone());
@@ -1817,6 +1880,11 @@ mod dashboard_tests {
         assert_eq!(c.idle_fps, 7.0);
         assert!(!c.no_audio);
         assert!(c.inferrig_url.is_some());
+        let monitor = parse_args_from(
+            ["--config", "examples/monitor.json"].map(str::to_owned).into_iter(),
+        ).unwrap();
+        assert_eq!((monitor.profile, monitor.theme), (Profile::Inference, Theme::Monitor));
+        assert!(monitor.inferrig_url.is_some() && monitor.no_audio);
         for flag in ["--classic", "--no-inferrig"] {
             let args = ["--config", "examples/inference.json", flag];
             assert!(parse_args_from(args.map(str::to_owned).into_iter())
